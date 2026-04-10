@@ -16,6 +16,8 @@ from linebot.models import (
     MessageEvent, TextMessage, TextSendMessage, JoinEvent
 )
 import anthropic
+from googleapiclient.discovery import build
+from google.oauth2 import service_account
 
 app = Flask(__name__)
 
@@ -28,6 +30,10 @@ line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 DB_PATH = os.environ.get('DB_PATH', 'messages.db')
+
+# Google Calendar設定
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '')
+GOOGLE_CALENDAR_ID = os.environ.get('GOOGLE_CALENDAR_ID', 'shikishimaeinou@gmail.com')
 
 # 業務区分（17区分）
 WORK_CATEGORIES = [
@@ -379,6 +385,78 @@ def _simple_analyze(text):
     }
 
 
+# ==================== Googleカレンダー転記 ====================
+
+def get_calendar_service():
+    """Google Calendar APIサービスを返す"""
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        return None
+    try:
+        creds_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        creds = service_account.Credentials.from_service_account_info(
+            creds_info,
+            scopes=['https://www.googleapis.com/auth/calendar']
+        )
+        return build('calendar', 'v3', credentials=creds)
+    except Exception as e:
+        print(f"Calendar service error: {e}")
+        return None
+
+
+def add_to_calendar(analysis, user_name, message_text):
+    """作業報告をGoogleカレンダーに転記する"""
+    work_category = analysis.get('work_category')
+    if not work_category:
+        return None  # 作業報告でなければスキップ
+
+    service = get_calendar_service()
+    if not service:
+        return None
+
+    # 日付を決定
+    work_date = analysis.get('work_date') or datetime.now().strftime('%Y-%m-%d')
+    try:
+        datetime.strptime(work_date, '%Y-%m-%d')
+    except ValueError:
+        work_date = datetime.now().strftime('%Y-%m-%d')
+
+    # タイトルを作成
+    hours = analysis.get('work_hours')
+    work_style = analysis.get('work_style')
+    title_parts = [f"【{work_category}】"]
+    if hours:
+        title_parts.append(f"{hours:.1f}h")
+    title_parts.append(f"- {user_name}")
+    if work_style:
+        title_parts.append(f"({work_style})")
+    title = " ".join(title_parts)
+
+    # 説明文
+    description = f"📱 LINEからの作業報告\n👤 {user_name}\n💬 {message_text}"
+    if work_style:
+        description += f"\n👥 作業スタイル: {work_style}"
+
+    # 終日イベントとして登録
+    event = {
+        'summary': title,
+        'description': description,
+        'start': {'date': work_date},
+        'end':   {'date': work_date},
+        'colorId': '2',  # 緑色
+    }
+
+    try:
+        result = service.events().insert(
+            calendarId=GOOGLE_CALENDAR_ID,
+            body=event
+        ).execute()
+        print(f"Calendar event created: {result.get('htmlLink')}")
+        return result.get('id')
+    except Exception as e:
+        print(f"Calendar insert error: {e}")
+        return None
+
+
 # ==================== DB保存 ====================
 
 def save_message(timestamp, group_id, user_id, user_name, message, message_id, analysis):
@@ -404,6 +482,10 @@ def save_message(timestamp, group_id, user_id, user_name, message, message_id, a
         print(f"DB save error: {e}")
     finally:
         conn.close()
+
+    # 作業報告ならGoogleカレンダーにも転記
+    if analysis.get('work_category'):
+        add_to_calendar(analysis, user_name, message)
 
 
 # ==================== ヘルスチェック ====================
