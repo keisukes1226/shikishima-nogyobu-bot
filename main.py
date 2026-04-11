@@ -1,12 +1,16 @@
 """
-しきしまの家 営農部 LINE業務サポートボット v4
+しきしまの家 営農部 LINE業務サポートボット v5
+- 全メッセージ保存・さかのぼり検索
 - 作業報告を自動記録・分類（Haiku）
+- ToDoの自動抽出・管理
+- 決定事項の自動記録
+- 未決案件の検知・フォローアップ
+- 知識の蓄積（「覚えておいて」）
 - @メンションには何でも回答（Sonnet）
 - 画像を送ると内容を解析・説明（Sonnet Vision）
-- 不明情報を確認する会話型フロー
-- 記録後に確認メッセージを送信
-- 「修正して」で記録を修正
-- Googleカレンダーに転記
+- 毎朝9時：スルー検知・未決フォローアップ
+- 毎週月曜：週報自動投稿
+- Googleカレンダーに作業記録を転記
 """
 
 import os
@@ -20,6 +24,7 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage, JoinEvent, ImageMessage
 import anthropic
+from apscheduler.schedulers.background import BackgroundScheduler
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 
@@ -35,10 +40,7 @@ DB_PATH = os.environ.get('DB_PATH', 'messages.db')
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '')
 GOOGLE_CALENDAR_ID = os.environ.get('GOOGLE_CALENDAR_ID', 'primary')
 
-# ==================== モデル設定 ====================
-# 作業報告の解析（速度・コスト重視）
 MODEL_FAST  = "claude-3-haiku-20240307"
-# @メンションへの回答（品質重視）
 MODEL_SMART = "claude-3-5-sonnet-20241022"
 
 WORK_CATEGORIES = [
@@ -49,19 +51,20 @@ WORK_CATEGORIES = [
 ]
 
 UNANSWERED_THRESHOLD_HOURS = 24
+PENDING_FOLLOWUP_DAYS = 3
 WEEKDAY_JP = ['月', '火', '水', '木', '金', '土', '日']
 
-# 会話ステート
-STATE_ASKING_HOURS   = 'asking_hours'
-STATE_ASKING_PEOPLE  = 'asking_people'
-STATE_CONFIRMING     = 'confirming'
+STATE_ASKING_HOURS  = 'asking_hours'
+STATE_ASKING_PEOPLE = 'asking_people'
+STATE_CONFIRMING    = 'confirming'
 
 CORRECTION_KEYWORDS = [
     '修正', '違う', 'ちがう', '間違', 'いや', 'そうじゃない',
     '取り消し', '削除', '消して', '直して', '変えて', 'ちょっと待って'
 ]
 
-# ボットのユーザーIDキャッシュ
+KNOWLEDGE_KEYWORDS = ['覚えておいて', '覚えて', '記録しておいて', 'メモしておいて']
+
 _BOT_USER_ID = None
 
 
@@ -70,6 +73,18 @@ _BOT_USER_ID = None
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS all_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            group_id TEXT NOT NULL,
+            user_id TEXT, user_name TEXT,
+            message TEXT,
+            message_id TEXT UNIQUE,
+            message_type TEXT DEFAULT 'general'
+        )
+    ''')
     c.execute('''
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,11 +116,91 @@ def init_db():
             updated_at TEXT
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS todos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT NOT NULL,
+            assignee TEXT,
+            task TEXT NOT NULL,
+            source_message TEXT,
+            created_by TEXT,
+            created_at TEXT,
+            due_date TEXT,
+            status TEXT DEFAULT 'open',
+            completed_at TEXT
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            source_message TEXT,
+            decided_by TEXT,
+            created_at TEXT
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS pending_issues (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            source_message TEXT,
+            raised_by TEXT,
+            created_at TEXT,
+            last_followup_at TEXT,
+            status TEXT DEFAULT 'open',
+            resolved_at TEXT
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS knowledge (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            stored_by TEXT,
+            created_at TEXT,
+            tag TEXT
+        )
+    ''')
     conn.commit()
     conn.close()
 
 
 init_db()
+
+
+# ==================== スケジューラ ====================
+
+def daily_check():
+    """毎朝9時：未返信チェック + 未決案件フォローアップ"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT group_id FROM groups')
+    groups = [row[0] for row in c.fetchall()]
+    conn.close()
+    for gid in groups:
+        notify_unanswered(gid)
+        followup_pending_issues(gid)
+
+
+def weekly_report_job():
+    """毎週月曜9時：週報を全グループに投稿"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT group_id FROM groups')
+    groups = [row[0] for row in c.fetchall()]
+    conn.close()
+    for gid in groups:
+        report = build_weekly_report(gid)
+        if report:
+            line_bot_api.push_message(gid, TextSendMessage(text=report))
+
+
+scheduler = BackgroundScheduler(timezone='Asia/Tokyo')
+scheduler.add_job(daily_check, 'cron', hour=9, minute=0)
+scheduler.add_job(weekly_report_job, 'cron', day_of_week='mon', hour=9, minute=0)
+scheduler.start()
 
 
 # ==================== Webhook ====================
@@ -144,6 +239,10 @@ def handle_join(event):
                 "どんな質問・相談にも答えます。\n\n"
                 "【コマンド】\n"
                 "「/未返信」→ 返信待ちメッセージ一覧\n"
+                "「/タスク」→ 未完了タスク一覧\n"
+                "「/決定事項」→ 最近の決定事項\n"
+                "「/未決」→ 検討中案件一覧\n"
+                "「/知識」→ 覚えている情報\n"
                 "「/ヘルプ」→ 使い方"
             )
         ))
@@ -162,7 +261,6 @@ def get_bot_user_id():
 
 
 def is_bot_mentioned(event):
-    """ボットへのメンションを検知"""
     try:
         msg = event.message
         if hasattr(msg, 'mention') and msg.mention:
@@ -173,68 +271,11 @@ def is_bot_mentioned(event):
                         return True
     except Exception as e:
         print(f"mention check error: {e}")
-    text = event.message.text
-    return bool(re.search(r'@\S+', text))
+    return bool(re.search(r'@\S+', event.message.text))
 
 
 def extract_mention_text(text):
-    """メンション部分（@〇〇）を除いたクエリを返す"""
     return re.sub(r'@\S+\s*', '', text).strip()
-
-
-# ==================== メッセージ受信（メイン） ====================
-
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    if event.source.type != 'group':
-        return
-
-    group_id     = event.source.group_id
-    user_id      = event.source.user_id
-    message_text = event.message.text.strip()
-    message_id   = event.message.id
-    timestamp    = datetime.fromtimestamp(
-        event.timestamp / 1000
-    ).strftime('%Y-%m-%d %H:%M:%S')
-    user_name    = get_user_name(group_id, user_id)
-
-    # ① コマンド
-    if message_text.startswith('/'):
-        handle_command(event, message_text, group_id)
-        return
-
-    # ② @メンション → Sonnetで何でも回答
-    if is_bot_mentioned(event):
-        handle_mention(event, message_text, user_name, group_id)
-        return
-
-    # ③ 会話ステートがあれば続きとして処理
-    pending = get_pending_state(group_id, user_id)
-    if pending:
-        handle_conversation_response(
-            event, pending, message_text, user_name,
-            group_id, user_id, timestamp, message_id
-        )
-        return
-
-    # ④ 新規メッセージとして解析（Haiku）
-    analysis = analyze_message(message_text, user_name)
-    mark_replied_context(group_id, user_id, message_text)
-
-    save_message(
-        timestamp, group_id, user_id, user_name,
-        message_text, message_id, analysis, create_calendar=False
-    )
-
-    if not analysis.get('work_category'):
-        return
-
-    process_work_report(
-        event, analysis, message_text, user_name, group_id, user_id
-    )
-
-    if datetime.now().hour == 9 and datetime.now().minute < 5:
-        notify_unanswered(group_id)
 
 
 def get_user_name(group_id, user_id):
@@ -245,21 +286,15 @@ def get_user_name(group_id, user_id):
         return user_id
 
 
-
-
 # ==================== 画像メッセージ対応（Sonnet Vision） ====================
 
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image(event):
-    """画像を受け取ってSonnetで解析"""
     if event.source.type != 'group':
         return
-
     group_id  = event.source.group_id
     user_id   = event.source.user_id
     user_name = get_user_name(group_id, user_id)
-
-    # 画像を取得してbase64に変換
     try:
         message_content = line_bot_api.get_message_content(event.message.id)
         image_data = b''.join(chunk for chunk in message_content.iter_content())
@@ -271,14 +306,11 @@ def handle_image(event):
             TextSendMessage(text="画像の取得に失敗しました🦉 もう一度送ってみてください。")
         )
         return
-
-    # Sonnetで画像解析
     reply = analyze_image_with_sonnet(image_base64, user_name)
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
 
 def analyze_image_with_sonnet(image_base64, user_name):
-    """Sonnet Visionで画像を解析"""
     if not ANTHROPIC_API_KEY:
         return "申し訳ありません、AIサービスに接続できません。"
     try:
@@ -298,25 +330,13 @@ def analyze_image_with_sonnet(image_base64, user_name):
                 "- 絵文字は🦉を中心に適度に使う\n"
                 "- 判別が難しい場合は正直にその旨を伝える"
             ),
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": image_base64,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": f"{user_name}さんが画像を送りました。これは何ですか？詳しく教えてください。"
-                        }
-                    ],
-                }
-            ],
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_base64}},
+                    {"type": "text", "text": f"{user_name}さんが画像を送りました。これは何ですか？詳しく教えてください。"}
+                ]
+            }]
         )
         return response.content[0].text.strip()
     except Exception as e:
@@ -324,27 +344,210 @@ def analyze_image_with_sonnet(image_base64, user_name):
         return f"⚠️ 画像の解析中にエラーが発生しました: {str(e)[:50]}"
 
 
+# ==================== メッセージ受信（メイン） ====================
+
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    if event.source.type != 'group':
+        return
+
+    group_id     = event.source.group_id
+    user_id      = event.source.user_id
+    message_text = event.message.text.strip()
+    message_id   = event.message.id
+    timestamp    = datetime.fromtimestamp(event.timestamp / 1000).strftime('%Y-%m-%d %H:%M:%S')
+    user_name    = get_user_name(group_id, user_id)
+
+    # 全メッセージを保存
+    save_all_message(timestamp, group_id, user_id, user_name, message_text, message_id)
+
+    # ① コマンド
+    if message_text.startswith('/'):
+        handle_command(event, message_text, group_id)
+        return
+
+    # ② @メンション
+    if is_bot_mentioned(event):
+        handle_mention(event, message_text, user_name, group_id)
+        return
+
+    # ③ 「覚えておいて」
+    if any(kw in message_text for kw in KNOWLEDGE_KEYWORDS):
+        handle_knowledge_store(event, message_text, user_name, group_id)
+        return
+
+    # ④ 会話ステート
+    pending = get_pending_state(group_id, user_id)
+    if pending:
+        handle_conversation_response(
+            event, pending, message_text, user_name,
+            group_id, user_id, timestamp, message_id
+        )
+        return
+
+    # ⑤ 通常メッセージ解析（Haiku）
+    analysis = analyze_message_full(message_text, user_name)
+    mark_replied_context(group_id, user_id, message_text)
+
+    save_message(timestamp, group_id, user_id, user_name,
+                 message_text, message_id, analysis, create_calendar=False)
+
+    process_metadata(analysis, message_text, user_name, group_id, timestamp)
+
+    if not analysis.get('work_category'):
+        return
+
+    process_work_report(event, analysis, message_text, user_name, group_id, user_id)
+
+
+# ==================== 全メッセージ保存 ====================
+
+def save_all_message(timestamp, group_id, user_id, user_name, message, message_id, message_type='general'):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute('''
+            INSERT OR IGNORE INTO all_messages
+            (timestamp, group_id, user_id, user_name, message, message_id, message_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (timestamp, group_id, user_id, user_name, message, message_id, message_type))
+        conn.commit()
+    except Exception as e:
+        print(f"save_all_message error: {e}")
+    finally:
+        conn.close()
+
+
+# ==================== ToDo・決定事項・未決案件の処理 ====================
+
+def process_metadata(analysis, message_text, user_name, group_id, timestamp):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    if analysis.get('has_todo') and analysis.get('todo_text'):
+        c.execute('''
+            INSERT INTO todos (group_id, assignee, task, source_message, created_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (group_id, analysis.get('todo_assignee'), analysis['todo_text'],
+              message_text, user_name, timestamp))
+
+    if analysis.get('has_decision') and analysis.get('decision_text'):
+        c.execute('''
+            INSERT INTO decisions (group_id, decision, source_message, decided_by, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (group_id, analysis['decision_text'], message_text, user_name, timestamp))
+
+    if analysis.get('is_pending_issue') and analysis.get('pending_summary'):
+        c.execute('''
+            INSERT INTO pending_issues (group_id, summary, source_message, raised_by, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (group_id, analysis['pending_summary'], message_text, user_name, timestamp))
+
+    conn.commit()
+    conn.close()
+
+
+# ==================== 知識ベース ====================
+
+def handle_knowledge_store(event, message_text, user_name, group_id):
+    content = message_text
+    for kw in KNOWLEDGE_KEYWORDS:
+        content = content.replace(kw, '').strip()
+    content = content.lstrip('：:').strip()
+
+    if not content:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="覚えておきたい内容を「覚えておいて：〇〇」の形で教えてください🦉")
+        )
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        'INSERT INTO knowledge (group_id, content, stored_by, created_at) VALUES (?, ?, ?, ?)',
+        (group_id, content, user_name, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    )
+    conn.commit()
+    conn.close()
+
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=f"🦉 覚えました！\n「{content[:50]}」\n\n「/知識」で確認できます。")
+    )
+
+
 # ==================== @メンション対応（Sonnet） ====================
 
 def handle_mention(event, message_text, user_name, group_id):
-    """@メンション → Sonnetで回答"""
     query = extract_mention_text(message_text)
     if not query:
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text="はい！何でもお気軽にどうぞ😊")
+            TextSendMessage(text="はい！何でもお気軽にどうぞ🦉")
         )
         return
+    context  = get_group_context(group_id)
+    history  = search_history(query, group_id)
+    knowledge = get_knowledge_context(group_id)
+    reply = ask_sonnet(query, user_name, context, history, knowledge)
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
-    context = get_group_context(group_id)
-    reply = ask_sonnet(query, user_name, context)
-    line_bot_api.reply_message(
-        event.reply_token, TextSendMessage(text=reply)
-    )
+
+def search_history(query, group_id, limit=20):
+    """過去のメッセージからクエリに関連するものを検索"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        keywords = [w for w in re.sub(r'[^\w]', ' ', query).split() if len(w) > 1]
+        results = []
+        for kw in keywords[:3]:
+            c.execute('''
+                SELECT timestamp, user_name, message FROM all_messages
+                WHERE group_id=? AND message LIKE ?
+                ORDER BY timestamp DESC LIMIT 10
+            ''', (group_id, f'%{kw}%'))
+            results.extend(c.fetchall())
+        conn.close()
+        if not results:
+            return ""
+        seen = set()
+        unique = []
+        for row in sorted(results, key=lambda x: x[0], reverse=True):
+            if row[2] not in seen:
+                seen.add(row[2])
+                unique.append(row)
+        lines = ["\n【過去のやり取り（関連）】"]
+        for ts, name, msg in unique[:limit]:
+            lines.append(f"  {ts[:10]} {name}:「{msg[:60]}」")
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"search_history error: {e}")
+        return ""
+
+
+def get_knowledge_context(group_id):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''
+            SELECT content, stored_by, created_at FROM knowledge
+            WHERE group_id=? ORDER BY created_at DESC LIMIT 20
+        ''', (group_id,))
+        rows = c.fetchall()
+        conn.close()
+        if not rows:
+            return ""
+        lines = ["\n【覚えている情報】"]
+        for content, stored_by, created_at in rows:
+            lines.append(f"  ・{content}（{stored_by}、{created_at[:10]}）")
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"get_knowledge_context error: {e}")
+        return ""
 
 
 def get_group_context(group_id):
-    """DBからグループの直近情報を取得してテキスト化"""
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -356,7 +559,6 @@ def get_group_context(group_id):
             WHERE group_id=? AND work_category IS NOT NULL
               AND work_date BETWEEN ? AND ?
             GROUP BY work_category, user_name
-            ORDER BY work_date DESC
         ''', (group_id, today.strftime('%Y-%m-01'), today.strftime('%Y-%m-%d')))
         work_rows = c.fetchall()
 
@@ -369,12 +571,18 @@ def get_group_context(group_id):
         unanswered_rows = c.fetchall()
 
         c.execute('''
-            SELECT user_name, work_category, work_hours, work_date, work_style
-            FROM messages
-            WHERE group_id=? AND work_category IS NOT NULL
-            ORDER BY work_date DESC, timestamp DESC LIMIT 10
+            SELECT assignee, task, created_at FROM todos
+            WHERE group_id=? AND status='open'
+            ORDER BY created_at DESC LIMIT 10
         ''', (group_id,))
-        recent_rows = c.fetchall()
+        todo_rows = c.fetchall()
+
+        c.execute('''
+            SELECT summary, raised_by, created_at FROM pending_issues
+            WHERE group_id=? AND status='open'
+            ORDER BY created_at DESC LIMIT 5
+        ''', (group_id,))
+        pending_rows = c.fetchall()
 
         conn.close()
 
@@ -391,25 +599,25 @@ def get_group_context(group_id):
             for name, msg, ts in unanswered_rows:
                 short = msg[:40] + "..." if len(msg) > 40 else msg
                 lines.append(f"  {name}（{ts[:10]}）:「{short}」")
-        else:
-            lines.append("\n返信待ちメッセージ: なし")
 
-        if recent_rows:
-            lines.append("\n直近の作業記録:")
-            for name, cat, hours, date, style in recent_rows:
-                h = f"{hours:.1f}h" if hours else "時間不明"
-                s = f" ({style})" if style else ""
-                lines.append(f"  {date} {name}: {cat} {h}{s}")
+        if todo_rows:
+            lines.append("\n未完了タスク:")
+            for assignee, task, created_at in todo_rows:
+                a = f"{assignee}さん" if assignee else "担当未定"
+                lines.append(f"  ・{a}: {task}（{created_at[:10]}）")
+
+        if pending_rows:
+            lines.append("\n検討中・未決案件:")
+            for summary, raised_by, created_at in pending_rows:
+                lines.append(f"  ・{summary}（{raised_by}、{created_at[:10]}）")
 
         return "\n".join(lines)
-
     except Exception as e:
         print(f"get_group_context error: {e}")
         return f"（データ取得エラー: {e}）"
 
 
-def ask_sonnet(query, user_name, db_context):
-    """Sonnetで質問に回答（オルオルとして）"""
+def ask_sonnet(query, user_name, db_context, history="", knowledge=""):
     if not ANTHROPIC_API_KEY:
         return "申し訳ありません、AIサービスに接続できません。"
     try:
@@ -429,15 +637,15 @@ def ask_sonnet(query, user_name, db_context):
 特定の組織や団体に属する存在ではなく、
 豊かな農村があればどこにでも宿る、普遍的な存在です。
 
-【このグループの記録データ】
 {db_context}
+{history}
+{knowledge}
 
 【回答ルール】
 - LINEのメッセージなので短く端的に（長くても15行以内）
-- 農業・農作業・農薬・気象・生態系など専門的な質問には詳しく答える
-- グループのデータ（集計・未返信など）を聞かれたら上記データを参照する
-- 計算や集計は正確に行う
-- わからないことや最新情報が必要な場合は正直に伝える
+- 過去のやり取りを聞かれた場合は、上記の履歴から該当する内容を探して答える
+- 「誰が言った」「いつ決まった」など事実確認は履歴から正確に答える
+- わからない・記録がない場合は正直に伝える
 - 絵文字は🦉を中心に適度に使って親しみやすく
 - 回答の最後に追加で確認できることがあれば一言添える"""
 
@@ -463,7 +671,10 @@ def process_work_report(event, analysis, message_text, user_name, group_id, user
         save_pending_state(group_id, user_id, missing['state'], analysis, message_text)
     else:
         event_id = add_to_calendar(analysis, user_name, message_text)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_confirmation(analysis, user_name)))
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=build_confirmation(analysis, user_name))
+        )
         save_pending_state(group_id, user_id, STATE_CONFIRMING, analysis, message_text, event_id)
 
 
@@ -482,7 +693,10 @@ def _has_people_hint(text):
 
 # ==================== 会話の続き ====================
 
-def handle_conversation_response(event, pending, message_text, user_name, group_id, user_id, timestamp, message_id):
+def handle_conversation_response(
+    event, pending, message_text, user_name,
+    group_id, user_id, timestamp, message_id
+):
     state   = pending['state']
     partial = pending['partial_analysis']
     is_correction = any(kw in message_text for kw in CORRECTION_KEYWORDS)
@@ -493,8 +707,9 @@ def handle_conversation_response(event, pending, message_text, user_name, group_
 
     if state == STATE_CONFIRMING:
         clear_pending_state(group_id, user_id)
-        analysis = analyze_message(message_text, user_name)
-        save_message(timestamp, group_id, user_id, user_name, message_text, message_id, analysis, create_calendar=False)
+        analysis = analyze_message_full(message_text, user_name)
+        save_message(timestamp, group_id, user_id, user_name,
+                     message_text, message_id, analysis, create_calendar=False)
         mark_replied_context(group_id, user_id, message_text)
         if analysis.get('work_category'):
             process_work_report(event, analysis, message_text, user_name, group_id, user_id)
@@ -507,16 +722,28 @@ def handle_conversation_response(event, pending, message_text, user_name, group_
                 text="⏱️ 時間が読み取れませんでした。\n「3時間」「2.5h」「半日」などで教えてください🙏"
             ))
             return
-        _finalize_or_ask_more(event, updated, pending['original_message'], user_name, group_id, user_id, timestamp, message_id)
+        _finalize_or_ask_more(
+            event, updated, pending['original_message'],
+            user_name, group_id, user_id, timestamp, message_id
+        )
 
     elif state == STATE_ASKING_PEOPLE:
         updated = parse_people_from_text(message_text, partial, user_name)
         event_id = add_to_calendar(updated, user_name, pending['original_message'])
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_confirmation(updated, user_name)))
-        save_pending_state(group_id, user_id, STATE_CONFIRMING, updated, pending['original_message'], event_id)
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=build_confirmation(updated, user_name))
+        )
+        save_pending_state(
+            group_id, user_id, STATE_CONFIRMING,
+            updated, pending['original_message'], event_id
+        )
 
 
-def _finalize_or_ask_more(event, analysis, original_message, user_name, group_id, user_id, timestamp, message_id):
+def _finalize_or_ask_more(
+    event, analysis, original_message, user_name,
+    group_id, user_id, timestamp, message_id
+):
     missing = get_missing_info(analysis, original_message)
     if missing:
         question = build_question(missing['state'], analysis, user_name)
@@ -524,8 +751,14 @@ def _finalize_or_ask_more(event, analysis, original_message, user_name, group_id
         save_pending_state(group_id, user_id, missing['state'], analysis, original_message)
     else:
         event_id = add_to_calendar(analysis, user_name, original_message)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_confirmation(analysis, user_name)))
-        save_pending_state(group_id, user_id, STATE_CONFIRMING, analysis, original_message, event_id)
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=build_confirmation(analysis, user_name))
+        )
+        save_pending_state(
+            group_id, user_id, STATE_CONFIRMING,
+            analysis, original_message, event_id
+        )
 
 
 def handle_correction(event, pending, message_text, user_name, group_id, user_id):
@@ -544,14 +777,14 @@ def handle_correction(event, pending, message_text, user_name, group_id, user_id
                 f"記録された内容: {json.dumps(last_analysis, ensure_ascii=False)}\n"
                 f"修正指示: {message_text}\n\n"
                 f"以下のJSONのみを返してください（説明文不要）:\n"
-                f"{{\n"
-                f'  "work_category": "{cat_str} のいずれか",\n'
-                f'  "work_hours": 数値またはnull,\n'
-                f'  "work_date": "YYYY-MM-DD",\n'
-                f'  "work_style": "本田+荻原" または "本田（単独）" または "荻原（単独）" または null\n'
-                f"}}"
+                f'{{\n  "work_category": "{cat_str} のいずれか",\n'
+                f'  "work_hours": 数値またはnull,\n  "work_date": "YYYY-MM-DD",\n'
+                f'  "work_style": "本田+荻原" または "本田（単独）" または "荻原（単独）" または null\n}}'
             )
-            response = client.messages.create(model=MODEL_FAST, max_tokens=200, messages=[{"role": "user", "content": prompt}])
+            response = client.messages.create(
+                model=MODEL_FAST, max_tokens=200,
+                messages=[{"role": "user", "content": prompt}]
+            )
             result = response.content[0].text.strip()
             if '{' in result:
                 result = result[result.index('{'):result.rindex('}') + 1]
@@ -561,7 +794,10 @@ def handle_correction(event, pending, message_text, user_name, group_id, user_id
     event_id = add_to_calendar(corrected, user_name, pending.get('original_message', ''))
     reply = "✏️ 修正しました！\n" + build_confirmation(corrected, user_name, header="")
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-    save_pending_state(group_id, user_id, STATE_CONFIRMING, corrected, pending.get('original_message', ''), event_id)
+    save_pending_state(
+        group_id, user_id, STATE_CONFIRMING,
+        corrected, pending.get('original_message', ''), event_id
+    )
 
 
 # ==================== メッセージ生成 ====================
@@ -677,16 +913,23 @@ def get_pending_state(group_id, user_id):
     return None
 
 
-def save_pending_state(group_id, user_id, state, partial_analysis, original_message, last_event_id=None):
+def save_pending_state(
+    group_id, user_id, state, partial_analysis, original_message, last_event_id=None
+):
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('DELETE FROM conversations WHERE group_id=? AND user_id=?', (group_id, user_id))
     c.execute('''
         INSERT INTO conversations
-        (group_id, user_id, state, partial_analysis, original_message, last_event_id, created_at, updated_at)
+        (group_id, user_id, state, partial_analysis, original_message,
+         last_event_id, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (group_id, user_id, state, json.dumps(partial_analysis, ensure_ascii=False), original_message, last_event_id, now, now))
+    ''', (
+        group_id, user_id, state,
+        json.dumps(partial_analysis, ensure_ascii=False),
+        original_message, last_event_id, now, now
+    ))
     conn.commit()
     conn.close()
 
@@ -707,21 +950,109 @@ def handle_command(event, text, group_id):
         reply = get_monthly_summary(group_id)
     elif cmd in ['/未返信', '/unanswered']:
         reply = get_unanswered_list(group_id)
+    elif cmd in ['/タスク', '/todo']:
+        reply = get_todo_list(group_id)
+    elif cmd in ['/決定事項', '/decisions']:
+        reply = get_decisions_list(group_id)
+    elif cmd in ['/未決', '/pending']:
+        reply = get_pending_list(group_id)
+    elif cmd in ['/知識', '/knowledge']:
+        reply = get_knowledge_list(group_id)
+    elif cmd in ['/週報', '/weekly']:
+        reply = build_weekly_report(group_id) or "📊 今週はまだデータがありません。"
     elif cmd in ['/ヘルプ', '/help']:
         reply = (
-            "【コマンド】\n"
-            "「/未返信」→ 返信待ちメッセージ一覧\n\n"
+            "【コマンド一覧】\n"
+            "「/未返信」→ 返信待ちメッセージ\n"
+            "「/タスク」→ 未完了タスク\n"
+            "「/決定事項」→ 最近の決定事項\n"
+            "「/未決」→ 検討中案件\n"
+            "「/知識」→ 覚えている情報\n"
+            "「/週報」→ 今週のサマリー\n\n"
             "【@オルオル で何でもOK】\n"
-            "質問・相談・調べもの・集計・確認…\n"
-            "気軽に声をかけてください🦉\n\n"
+            "質問・調べもの・過去の話…気軽に🦉\n\n"
+            "【覚えておいて：○○】\n"
+            "情報をオルオルに記憶させられます\n\n"
             "【営農グループ限定】\n"
             "「/集計」→ 今月の作業時間集計\n"
-            "作業報告は自動で記録・分類されます\n"
-            "記録後15分以内に「修正して」で修正できます✏️"
+            "作業報告は自動で記録・分類されます✏️"
         )
     else:
         return
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+
+
+def get_todo_list(group_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        SELECT assignee, task, created_at FROM todos
+        WHERE group_id=? AND status='open'
+        ORDER BY created_at DESC LIMIT 15
+    ''', (group_id,))
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return "✅ 未完了タスクはありません！"
+    lines = [f"📋 未完了タスク（{len(rows)}件）\n"]
+    for assignee, task, created_at in rows:
+        a = f"{assignee}さん" if assignee else "担当未定"
+        lines.append(f"・{a}: {task}\n  （{created_at[:10]}）")
+    return "\n".join(lines)
+
+
+def get_decisions_list(group_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    cutoff = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+    c.execute('''
+        SELECT decision, decided_by, created_at FROM decisions
+        WHERE group_id=? AND created_at>?
+        ORDER BY created_at DESC LIMIT 15
+    ''', (group_id, cutoff))
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return "📝 直近30日の決定事項はまだ記録されていません。"
+    lines = ["📝 最近の決定事項\n"]
+    for decision, decided_by, created_at in rows:
+        lines.append(f"・{decision}\n  （{decided_by}、{created_at[:10]}）")
+    return "\n".join(lines)
+
+
+def get_pending_list(group_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        SELECT summary, raised_by, created_at FROM pending_issues
+        WHERE group_id=? AND status='open'
+        ORDER BY created_at DESC LIMIT 10
+    ''', (group_id,))
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return "✅ 未決の案件はありません！"
+    lines = [f"🤔 検討中・未決案件（{len(rows)}件）\n"]
+    for summary, raised_by, created_at in rows:
+        lines.append(f"・{summary}\n  （{raised_by}、{created_at[:10]}）")
+    return "\n".join(lines)
+
+
+def get_knowledge_list(group_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        SELECT content, stored_by, created_at FROM knowledge
+        WHERE group_id=? ORDER BY created_at DESC LIMIT 20
+    ''', (group_id,))
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return "🦉 まだ何も覚えていません。\n「覚えておいて：〇〇」で教えてください！"
+    lines = [f"🦉 覚えている情報（{len(rows)}件）\n"]
+    for content, stored_by, created_at in rows:
+        lines.append(f"・{content}\n  （{stored_by}、{created_at[:10]}）")
+    return "\n".join(lines)
 
 
 def get_monthly_summary(group_id):
@@ -750,7 +1081,9 @@ def get_monthly_summary(group_id):
 
 
 def get_unanswered_list(group_id):
-    threshold = (datetime.now() - timedelta(hours=UNANSWERED_THRESHOLD_HOURS)).strftime('%Y-%m-%d %H:%M:%S')
+    threshold = (
+        datetime.now() - timedelta(hours=UNANSWERED_THRESHOLD_HOURS)
+    ).strftime('%Y-%m-%d %H:%M:%S')
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''
@@ -769,12 +1102,108 @@ def get_unanswered_list(group_id):
     return "\n\n".join(lines)
 
 
-# ==================== スルー検知 ====================
+# ==================== 週報 ====================
+
+def build_weekly_report(group_id):
+    today = datetime.now()
+    week_ago = (today - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    c.execute('''
+        SELECT work_category, user_name, SUM(work_hours), COUNT(*)
+        FROM messages
+        WHERE group_id=? AND work_category IS NOT NULL AND timestamp>?
+        GROUP BY work_category, user_name
+    ''', (group_id, week_ago))
+    work_rows = c.fetchall()
+
+    c.execute('''
+        SELECT decision, decided_by FROM decisions
+        WHERE group_id=? AND created_at>? ORDER BY created_at DESC LIMIT 5
+    ''', (group_id, week_ago))
+    decision_rows = c.fetchall()
+
+    c.execute('''
+        SELECT assignee, task FROM todos
+        WHERE group_id=? AND status='open' ORDER BY created_at LIMIT 5
+    ''', (group_id,))
+    todo_rows = c.fetchall()
+
+    c.execute('''
+        SELECT summary FROM pending_issues
+        WHERE group_id=? AND status='open' ORDER BY created_at LIMIT 5
+    ''', (group_id,))
+    pending_rows = c.fetchall()
+
+    conn.close()
+
+    if not work_rows and not decision_rows and not todo_rows:
+        return None
+
+    lines = [f"🦉 週報（{today.strftime('%m/%d')}）\n━━━━━━━━━━━━"]
+
+    if work_rows:
+        lines.append("【今週の作業】")
+        for cat, name, hours, count in work_rows:
+            h = hours or 0
+            lines.append(f"  {name}: {cat} {h:.1f}h")
+
+    if decision_rows:
+        lines.append("\n【今週の決定事項】")
+        for decision, decided_by in decision_rows:
+            lines.append(f"  ・{decision}")
+
+    if todo_rows:
+        lines.append("\n【未完了タスク】")
+        for assignee, task in todo_rows:
+            a = f"{assignee}さん" if assignee else "担当未定"
+            lines.append(f"  ・{a}: {task}")
+
+    if pending_rows:
+        lines.append("\n【検討中の案件】")
+        for (summary,) in pending_rows:
+            lines.append(f"  ・{summary}")
+
+    lines.append("━━━━━━━━━━━━")
+    return "\n".join(lines)
+
+
+# ==================== スルー検知・未決フォローアップ ====================
 
 def notify_unanswered(group_id):
     msg = get_unanswered_list(group_id)
     if "返信待ち" in msg and "✅" not in msg:
         line_bot_api.push_message(group_id, TextSendMessage(text=msg))
+
+
+def followup_pending_issues(group_id):
+    """PENDING_FOLLOWUP_DAYS日以上経過した未決案件をフォローアップ"""
+    cutoff = (datetime.now() - timedelta(days=PENDING_FOLLOWUP_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        SELECT id, summary, raised_by, created_at FROM pending_issues
+        WHERE group_id=? AND status='open'
+          AND (last_followup_at IS NULL OR last_followup_at<?)
+          AND created_at<?
+        ORDER BY created_at ASC LIMIT 3
+    ''', (group_id, cutoff, cutoff))
+    rows = c.fetchall()
+
+    if rows:
+        lines = ["🦉 フォローアップです。以下の案件、その後いかがでしょう？\n"]
+        ids = []
+        for issue_id, summary, raised_by, created_at in rows:
+            lines.append(f"・{summary}（{raised_by}、{created_at[:10]}）")
+            ids.append(issue_id)
+        line_bot_api.push_message(group_id, TextSendMessage(text="\n".join(lines)))
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        for issue_id in ids:
+            c.execute('UPDATE pending_issues SET last_followup_at=? WHERE id=?', (now, issue_id))
+        conn.commit()
+
+    conn.close()
 
 
 def mark_replied_context(group_id, user_id, message_text):
@@ -785,7 +1214,11 @@ def mark_replied_context(group_id, user_id, message_text):
         c.execute('''
             UPDATE messages SET replied=1
             WHERE group_id=? AND needs_reply=1 AND replied=0
-            AND id IN (SELECT id FROM messages WHERE group_id=? AND needs_reply=1 AND replied=0 ORDER BY timestamp DESC LIMIT 5)
+            AND id IN (
+                SELECT id FROM messages
+                WHERE group_id=? AND needs_reply=1 AND replied=0
+                ORDER BY timestamp DESC LIMIT 5
+            )
         ''', (group_id, group_id))
         conn.commit()
         conn.close()
@@ -793,34 +1226,43 @@ def mark_replied_context(group_id, user_id, message_text):
 
 # ==================== Claude解析（Haiku） ====================
 
-def analyze_message(text, user_name):
-    """作業報告の解析はHaikuで（速度・コスト重視）"""
+def analyze_message_full(text, user_name):
+    """メッセージを総合解析（作業報告・ToDo・決定事項・未決案件）"""
     if not ANTHROPIC_API_KEY:
         return _simple_analyze(text)
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     categories_str = "、".join(WORK_CATEGORIES)
-    prompt = f"""農業法人のLINEグループメッセージを分析してください。
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    prompt = f"""農業グループのLINEメッセージを分析し、以下のJSONのみを返してください（説明文不要）。
 
 送信者: {user_name}
 メッセージ: {text}
+今日: {today_str}
 
-以下をJSON形式で返してください（説明文不要、JSONのみ）:
 {{
   "needs_reply": true/false,
   "work_category": "{categories_str} のいずれか、または null",
-  "work_hours": 作業時間（数値）または null,
+  "work_hours": 数値またはnull,
   "work_date": "YYYY-MM-DD" または null,
-  "work_style": "本田+荻原" または "荻原（単独）" または "本田（単独）" または null
+  "work_style": "本田+荻原" / "本田（単独）" / "荻原（単独）" / null,
+  "has_todo": true/false,
+  "todo_text": "タスクの内容" または null,
+  "todo_assignee": "担当者名" または null,
+  "has_decision": true/false,
+  "decision_text": "決定事項の内容" または null,
+  "is_pending_issue": true/false,
+  "pending_summary": "検討中案件の要約" または null
 }}
 
 判断基準:
-- needs_reply: 質問・依頼・確認要求など返答が必要なら true
-- work_category: 作業報告が含まれていれば分類、なければ null
-- work_hours: 「3時間」「2h」「午前中」(3h換算)等から抽出
-- work_date: 「今日」「昨日」「12/15」等から推定（今日={datetime.now().strftime('%Y-%m-%d')}）
-- work_style: 2人作業・本田さんと・荻原さんと等から判定"""
+- has_todo: 「〜しておいて」「〜お願い」「〜やっておく」など具体的なタスクがある
+- has_decision: 「〜することになった」「〜に決まった」「〜でいこう」など決定を示す
+- is_pending_issue: 「〜どうする？」「〜検討しよう」「〜考えないと」など未解決の課題がある"""
     try:
-        response = client.messages.create(model=MODEL_FAST, max_tokens=300, messages=[{"role": "user", "content": prompt}])
+        response = client.messages.create(
+            model=MODEL_FAST, max_tokens=400,
+            messages=[{"role": "user", "content": prompt}]
+        )
         result_text = response.content[0].text.strip()
         if '{' in result_text:
             result_text = result_text[result_text.index('{'):result_text.rindex('}') + 1]
@@ -831,23 +1273,30 @@ def analyze_message(text, user_name):
 
 
 def _simple_analyze(text):
-    needs_reply = any(kw in text for kw in ['？', '?', 'どうします', 'どうでしょう', 'お願い', 'ください', '確認', '教えて', '何時', 'いつ', 'どこ'])
+    needs_reply = any(kw in text for kw in ['？', '?', 'どうします', 'お願い', '確認', '教えて'])
     m = re.search(r'(\d+(?:\.\d+)?)\s*[hｈ時間]', text)
     work_hours = float(m.group(1)) if m else None
     work_cat = None
     for cat, kws in {
-        '水稲': ['水稲', '田植え', '稲刈り', 'コンバイン', '田んぼ'],
+        '水稲': ['水稲', '田植え', '稲刈り', 'コンバイン'],
         '大豆': ['大豆', '枝豆'],
-        'くるみ（脱穀）': ['脱穀', 'くるみ脱穀'],
-        'くるみ（選別）': ['選別', 'くるみ選別'],
         '除草・畔草刈': ['除草', '草刈', '畔'],
-        '水管理・用水路': ['水管理', '水路', '灌水'],
-        '農機・施設管理': ['トラクター', '農機', '機械', '修理'],
+        '水管理・用水路': ['水管理', '水路'],
+        '農機・施設管理': ['トラクター', '農機', '機械'],
     }.items():
         if any(kw in text for kw in kws):
             work_cat = cat
             break
-    return {"needs_reply": needs_reply, "work_category": work_cat, "work_hours": work_hours, "work_date": datetime.now().strftime('%Y-%m-%d'), "work_style": None}
+    return {
+        "needs_reply": needs_reply,
+        "work_category": work_cat,
+        "work_hours": work_hours,
+        "work_date": datetime.now().strftime('%Y-%m-%d'),
+        "work_style": None,
+        "has_todo": False, "todo_text": None, "todo_assignee": None,
+        "has_decision": False, "decision_text": None,
+        "is_pending_issue": False, "pending_summary": None
+    }
 
 
 # ==================== Googleカレンダー ====================
@@ -885,13 +1334,15 @@ def add_to_calendar(analysis, user_name, message_text):
     title_parts.append(f"- {user_name}")
     if style:
         title_parts.append(f"({style})")
-    description = f"📱 LINEからの作業報告\n👤 {user_name}\n💬 {message_text}"
-    if style:
-        description += f"\n👥 {style}"
-    event = {'summary': " ".join(title_parts), 'description': description, 'start': {'date': work_date}, 'end': {'date': work_date}, 'colorId': '2'}
+    event = {
+        'summary': " ".join(title_parts),
+        'description': f"📱 LINEからの作業報告\n👤 {user_name}\n💬 {message_text}" + (f"\n👥 {style}" if style else ""),
+        'start': {'date': work_date},
+        'end':   {'date': work_date},
+        'colorId': '2',
+    }
     try:
         result = service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
-        print(f"Calendar event created: {result.get('htmlLink')}")
         return result.get('id')
     except Exception as e:
         print(f"Calendar insert error: {e}")
@@ -904,14 +1355,16 @@ def delete_calendar_event(event_id):
         return
     try:
         service.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=event_id).execute()
-        print(f"Calendar event deleted: {event_id}")
     except Exception as e:
         print(f"Calendar delete error: {e}")
 
 
 # ==================== DB保存 ====================
 
-def save_message(timestamp, group_id, user_id, user_name, message, message_id, analysis, create_calendar=True):
+def save_message(
+    timestamp, group_id, user_id, user_name, message, message_id,
+    analysis, create_calendar=True
+):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
@@ -942,10 +1395,20 @@ def save_message(timestamp, group_id, user_id, user_name, message, message_id, a
 def health():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('SELECT COUNT(*) FROM messages')
-    count = c.fetchone()[0]
+    c.execute('SELECT COUNT(*) FROM all_messages')
+    all_count = c.fetchone()[0]
+    c.execute('SELECT COUNT(*) FROM todos WHERE status="open"')
+    todo_count = c.fetchone()[0]
+    c.execute('SELECT COUNT(*) FROM pending_issues WHERE status="open"')
+    pending_count = c.fetchone()[0]
     conn.close()
-    return {'status': 'ok', 'message_count': count, 'models': {'fast': MODEL_FAST, 'smart': MODEL_SMART}}
+    return {
+        'status': 'ok',
+        'all_messages': all_count,
+        'open_todos': todo_count,
+        'pending_issues': pending_count,
+        'models': {'fast': MODEL_FAST, 'smart': MODEL_SMART}
+    }
 
 
 if __name__ == "__main__":
