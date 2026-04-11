@@ -1,7 +1,8 @@
 """
-しきしまの家 営農部 LINE業務サポートボット v3
+しきしまの家 営農部 LINE業務サポートボット v4
 - 作業報告を自動記録・分類（Haiku）
 - @メンションには何でも回答（Sonnet）
+- 画像を送ると内容を解析・説明（Sonnet Vision）
 - 不明情報を確認する会話型フロー
 - 記録後に確認メッセージを送信
 - 「修正して」で記録を修正
@@ -12,11 +13,12 @@ import os
 import json
 import re
 import sqlite3
+import base64
 from datetime import datetime, timedelta
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage, JoinEvent
+from linebot.models import MessageEvent, TextMessage, TextSendMessage, JoinEvent, ImageMessage
 import anthropic
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
@@ -241,6 +243,85 @@ def get_user_name(group_id, user_id):
         return profile.display_name
     except Exception:
         return user_id
+
+
+
+
+# ==================== 画像メッセージ対応（Sonnet Vision） ====================
+
+@handler.add(MessageEvent, message=ImageMessage)
+def handle_image(event):
+    """画像を受け取ってSonnetで解析"""
+    if event.source.type != 'group':
+        return
+
+    group_id  = event.source.group_id
+    user_id   = event.source.user_id
+    user_name = get_user_name(group_id, user_id)
+
+    # 画像を取得してbase64に変換
+    try:
+        message_content = line_bot_api.get_message_content(event.message.id)
+        image_data = b''.join(chunk for chunk in message_content.iter_content())
+        image_base64 = base64.standard_b64encode(image_data).decode('utf-8')
+    except Exception as e:
+        print(f"Image download error: {e}")
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="画像の取得に失敗しました🦉 もう一度送ってみてください。")
+        )
+        return
+
+    # Sonnetで画像解析
+    reply = analyze_image_with_sonnet(image_base64, user_name)
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+
+
+def analyze_image_with_sonnet(image_base64, user_name):
+    """Sonnet Visionで画像を解析"""
+    if not ANTHROPIC_API_KEY:
+        return "申し訳ありません、AIサービスに接続できません。"
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model=MODEL_SMART,
+            max_tokens=600,
+            system=(
+                "あなたは「オルオル」。日本の豊かな農村に太古の昔から棲み続けるフクロウの神様です。\n"
+                "送られてきた画像を見て、農業・自然・生き物・植物・病害虫・農作物・農機具・"
+                "現場の状況など、何でも詳しく解説してください。\n"
+                "【回答ルール】\n"
+                "- 何が写っているか簡潔に特定する\n"
+                "- 農業や現場作業に関連する情報があれば詳しく補足する\n"
+                "- 病害虫・雑草の場合は対処法も添える\n"
+                "- LINEなので長くても15行以内\n"
+                "- 絵文字は🦉を中心に適度に使う\n"
+                "- 判別が難しい場合は正直にその旨を伝える"
+            ),
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_base64,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": f"{user_name}さんが画像を送りました。これは何ですか？詳しく教えてください。"
+                        }
+                    ],
+                }
+            ],
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        print(f"Image analysis error: {e}")
+        return f"⚠️ 画像の解析中にエラーが発生しました: {str(e)[:50]}"
 
 
 # ==================== @メンション対応（Sonnet） ====================
