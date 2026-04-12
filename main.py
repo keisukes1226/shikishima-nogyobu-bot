@@ -163,11 +163,55 @@ def init_db():
             tag TEXT
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS recent_media (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT NOT NULL,
+            user_id TEXT,
+            message_id TEXT NOT NULL,
+            filename TEXT,
+            media_type TEXT,
+            timestamp TEXT NOT NULL
+        )
+    ''')
     conn.commit()
     conn.close()
 
 
 init_db()
+
+
+def save_recent_media(group_id, user_id, message_id, filename, media_type):
+    """ファイル・画像のメッセージIDをDBに保存（自動分析しない）"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    c.execute(
+        'INSERT INTO recent_media (group_id, user_id, message_id, filename, media_type, timestamp) VALUES (?,?,?,?,?,?)',
+        (group_id, user_id, message_id, filename, media_type, ts)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_recent_media(group_id, media_type=None, minutes=60):
+    """直近N分以内の最新ファイル/画像情報を取得"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    cutoff = (datetime.now() - timedelta(minutes=minutes)).strftime('%Y-%m-%d %H:%M:%S')
+    if media_type:
+        c.execute(
+            'SELECT message_id, filename, media_type, user_id FROM recent_media WHERE group_id=? AND media_type=? AND timestamp>=? ORDER BY timestamp DESC LIMIT 1',
+            (group_id, media_type, cutoff)
+        )
+    else:
+        c.execute(
+            'SELECT message_id, filename, media_type, user_id FROM recent_media WHERE group_id=? AND timestamp>=? ORDER BY timestamp DESC LIMIT 1',
+            (group_id, cutoff)
+        )
+    row = c.fetchone()
+    conn.close()
+    return row
 
 
 # ==================== スケジューラ ====================
@@ -304,22 +348,11 @@ def get_user_name(group_id, user_id):
 def handle_image(event):
     if event.source.type != 'group':
         return
-    group_id  = event.source.group_id
-    user_id   = event.source.user_id
-    user_name = get_user_name(group_id, user_id)
-    try:
-        message_content = line_bot_api.get_message_content(event.message.id)
-        image_data = b''.join(chunk for chunk in message_content.iter_content())
-        image_base64 = base64.standard_b64encode(image_data).decode('utf-8')
-    except Exception as e:
-        print(f"Image download error: {e}")
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="画像の取得に失敗しました🦉 もう一度送ってみてください。")
-        )
-        return
-    reply = analyze_image_with_sonnet(image_base64, user_name)
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+    group_id = event.source.group_id
+    user_id  = event.source.user_id
+    # 画像IDを保存するだけ（自動分析しない）
+    # 「@オルオル この画像見て」と言われた時に分析する
+    save_recent_media(group_id, user_id, event.message.id, '画像', 'image')
 
 
 # ==================== ファイル対応（txt/pdf/docx/xlsx/csv） ====================
@@ -373,55 +406,19 @@ def extract_file_text(file_bytes, filename):
 
 
 def handle_file_raw(ev):
-    """SDKのFileMessage dispatchを使わずRAWイベントから直接ファイルを処理"""
+    """ファイルイベントのメッセージIDをDBに保存するだけ（自動分析しない）"""
     source = ev.get('source', {})
-    if source.get('type') != 'group':
+    src_type = source.get('type', '')
+    if src_type not in ('group', 'room'):
         return
-    group_id  = source.get('groupId', '')
-    user_id   = source.get('userId', '')
-    msg       = ev.get('message', {})
-    filename  = msg.get('fileName', 'unknown')
+    group_id   = source.get('groupId') or source.get('roomId', '')
+    user_id    = source.get('userId', '')
+    msg        = ev.get('message', {})
+    filename   = msg.get('fileName', 'unknown')
     message_id = msg.get('id', '')
-    reply_token = ev.get('replyToken', '')
-    user_name = get_user_name(group_id, user_id)
-
-    print(f"[FILE RAW] group={group_id} user={user_name} file={filename}", flush=True)
-
-    # 受信確認をreply
-    try:
-        line_bot_api.reply_message(
-            reply_token,
-            TextSendMessage(text=f'「{filename}」を確認しますね🦉…')
-        )
-    except Exception as e:
-        print(f"[FILE RAW] reply error: {e}", flush=True)
-
-    # ファイルをダウンロード
-    try:
-        message_content = line_bot_api.get_message_content(message_id)
-        file_bytes = b''.join(chunk for chunk in message_content.iter_content())
-    except Exception as e:
-        print(f"[FILE RAW] download error: {e}", flush=True)
-        line_bot_api.push_message(group_id, TextSendMessage(text='ファイルの取得に失敗しました🦉 もう一度送ってみてください。'))
-        return
-
-    file_text = extract_file_text(file_bytes, filename)
-    if not file_text.strip():
-        line_bot_api.push_message(group_id, TextSendMessage(text=f'「{filename}」からテキストを読み取れませんでした🦉'))
-        return
-
-    MAX_CHARS = 8000
-    truncated_note = ''
-    if len(file_text) > MAX_CHARS:
-        file_text = file_text[:MAX_CHARS]
-        truncated_note = f'\n\n※ファイルが長いため最初の{MAX_CHARS}文字のみ読み込みました。'
-
-    prompt = f"""{user_name}さんが「{filename}」というファイルを共有しました。\n内容を確認して要点をまとめてください。\n\n--- ファイル内容 ---\n{file_text}\n--- 以上 ---"""
-    context   = get_group_context(group_id)
-    history   = search_history(filename, group_id)
-    knowledge = get_knowledge_context(group_id)
-    reply = ask_sonnet(prompt, user_name, context, history, knowledge)
-    line_bot_api.push_message(group_id, TextSendMessage(text=reply + truncated_note))
+    save_recent_media(group_id, user_id, message_id, filename, 'file')
+    print(f"[FILE] saved: group={group_id} file={filename}", flush=True)
+    # 返信しない（スタッフ同士のファイル共有を邪魔しない）
 
 
 @handler.add(MessageEvent, message=FileMessage)
@@ -650,7 +647,76 @@ def handle_mention(event, message_text, user_name, group_id):
             TextSendMessage(text="はい！何でもお気軽にどうぞ🦉")
         )
         return
-    # まず「考え中」を即座に返信してreply_tokenを使い切る
+
+    # ファイル・画像分析リクエストを検知
+    FILE_KEYWORDS = ['読んで', '読み込んで', 'ファイル', '分析して', '要約して', 'まとめて', '内容見て']
+    IMAGE_KEYWORDS = ['画像', '写真', '見て', '解析して', 'これどう', '何これ']
+    is_file_req  = any(kw in query for kw in FILE_KEYWORDS)
+    is_image_req = any(kw in query for kw in IMAGE_KEYWORDS)
+
+    if is_file_req:
+        recent = get_recent_media(group_id, 'file')
+        if recent:
+            message_id, filename, _, _ = recent
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f'「{filename}」を読み込みますね🦉…')
+            )
+            try:
+                message_content = line_bot_api.get_message_content(message_id)
+                file_bytes = b''.join(chunk for chunk in message_content.iter_content())
+            except Exception as e:
+                line_bot_api.push_message(group_id, TextSendMessage(text=f'ファイルの取得に失敗しました🦉（{e}）'))
+                return
+            file_text = extract_file_text(file_bytes, filename)
+            if not file_text.strip():
+                line_bot_api.push_message(group_id, TextSendMessage(text=f'「{filename}」からテキストを読み取れませんでした🦉'))
+                return
+            MAX_CHARS = 8000
+            truncated_note = ''
+            if len(file_text) > MAX_CHARS:
+                file_text = file_text[:MAX_CHARS]
+                truncated_note = f'\n\n※長いため最初の{MAX_CHARS}文字のみ読み込みました。'
+            prompt = f'{user_name}さんが「{filename}」というファイルを共有しました。内容を確認して要点をまとめてください。\n\n--- ファイル内容 ---\n{file_text}\n--- 以上 ---'
+            context  = get_group_context(group_id)
+            history  = search_history(filename, group_id)
+            knowledge = get_knowledge_context(group_id)
+            reply = ask_sonnet(prompt, user_name, context, history, knowledge)
+            line_bot_api.push_message(group_id, TextSendMessage(text=reply + truncated_note))
+            return
+        else:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text='直近1時間以内に送られたファイルが見つかりません🦉\nファイルを送ってから「@オルオル 読んで」と言ってね！')
+            )
+            return
+
+    if is_image_req:
+        recent = get_recent_media(group_id, 'image')
+        if recent:
+            message_id, filename, _, _ = recent
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text='画像を確認しますね🦉…')
+            )
+            try:
+                message_content = line_bot_api.get_message_content(message_id)
+                image_data = b''.join(chunk for chunk in message_content.iter_content())
+                image_base64 = base64.standard_b64encode(image_data).decode('utf-8')
+            except Exception as e:
+                line_bot_api.push_message(group_id, TextSendMessage(text=f'画像の取得に失敗しました🦉（{e}）'))
+                return
+            reply = analyze_image_with_sonnet(image_base64, user_name)
+            line_bot_api.push_message(group_id, TextSendMessage(text=reply))
+            return
+        else:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text='直近1時間以内に送られた画像が見つかりません🦉\n画像を送ってから「@オルオル 見て」と言ってね！')
+            )
+            return
+
+    # 通常のテキスト質問
     line_bot_api.reply_message(
         event.reply_token,
         TextSendMessage(text="少し考えますね🦉…")
