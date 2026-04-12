@@ -1,16 +1,16 @@
 """
-しきしまの家 営農部 LINE業務サポートボット v5
-- 全メッセージ保存・さかのぼり検索
-- 作業報告を自動記録・分類（Haiku）
-- ToDoの自動抽出・管理
-- 決定事項の自動記録
-- 未決案件の検知・フォローアップ
-- 知識の蓄積（「覚えておいて」）
-- @メンションには何でも回答（Sonnet）
-- 画像を送ると内容を解析・説明（Sonnet Vision）
-- 毎朝9時：スルー検知・未決フォローアップ
-- 毎週月曜：週報自動投
-- Googleカレンダーに作業記録を転記
+ãããã¾ã®å®¶ å¶è¾²é¨ LINEæ¥­åãµãã¼ãããã v5
+- å¨ã¡ãã»ã¼ã¸ä¿å­ã»ããã®ã¼ãæ¤ç´¢
+- ä½æ¥­å ±åãèªåè¨é²ã»åé¡ï¼Haikuï¼
+- ToDoã®èªåæ½åºã»ç®¡ç
+- æ±ºå®äºé ã®èªåè¨é²
+- æªæ±ºæ¡ä»¶ã®æ¤ç¥ã»ãã©ã­ã¼ã¢ãã
+- ç¥è­ã®èç©ï¼ãè¦ãã¦ããã¦ãï¼
+- @ã¡ã³ã·ã§ã³ã«ã¯ä½ã§ãåç­ï¼Sonnetï¼
+- ç»åãéãã¨åå®¹ãè§£æã»èª¬æï¼Sonnet Visionï¼
+- æ¯æ9æï¼ã¹ã«ã¼æ¤ç¥ã»æªæ±ºãã©ã­ã¼ã¢ãã
+- æ¯é±ææï¼é±å ±èªåæ
+- Googleã«ã¬ã³ãã¼ã«ä½æ¥­è¨é²ãè»¢è¨
 """
 
 import os
@@ -44,31 +44,31 @@ MODEL_FAST  = "claude-haiku-4-5-20251001"
 MODEL_SMART = "claude-sonnet-4-20250514"
 
 WORK_CATEGORIES = [
-    "水稲", "大豆", "野菜", "農機・施設管理", "除草・畔草刈",
-    "水管理・用水路", "環境整備", "共同作業一般", "組合業務", "研修・視察",
-    "くるみ（脱穀）", "くるみ（選別）", "くるみ（その他）",
-    "野菜（個人）", "米（個人）", "くるみ（個人）", "その他個人"
+    "æ°´ç¨²", "å¤§è±", "éè", "è¾²æ©ã»æ½è¨­ç®¡ç", "é¤èã»çèå",
+    "æ°´ç®¡çã»ç¨æ°´è·¯", "ç°å¢æ´å", "å±åä½æ¥­ä¸è¬", "çµåæ¥­å", "ç ä¿®ã»è¦å¯",
+    "ããã¿ï¼è±ç©ï¼", "ããã¿ï¼é¸å¥ï¼", "ããã¿ï¼ãã®ä»ï¼",
+    "éèï¼åäººï¼", "ç±³ï¼åäººï¼", "ããã¿ï¼åäººï¼", "ãã®ä»åäºº"
 ]
 
 UNANSWERED_THRESHOLD_HOURS = 24
 PENDING_FOLLOWUP_DAYS = 3
-WEEKDAY_JP = ['月', '火', '水', '木', '金', '土', '日']
+WEEKDAY_JP = ['æ', 'ç«', 'æ°´', 'æ¨', 'é', 'å', 'æ¥']
 
 STATE_ASKING_HOURS  = 'asking_hours'
 STATE_ASKING_PEOPLE = 'asking_people'
 STATE_CONFIRMING    = 'confirming'
 
 CORRECTION_KEYWORDS = [
-    '修正', '違う', 'ちがう', '間違', 'いや', 'そうじゃない',
-    '取り消し', '削除', '消して', '直して', '変えて', 'ちょっと待って'
+    'ä¿®æ­£', 'éã', 'ã¡ãã', 'éé', 'ãã', 'ãããããªã',
+    'åãæ¶ã', 'åé¤', 'æ¶ãã¦', 'ç´ãã¦', 'å¤ãã¦', 'ã¡ãã£ã¨å¾ã£ã¦'
 ]
 
-KNOWLEDGE_KEYWORDS = ['覚えておいて', '覚えて', '記録しておいて', 'メモしておいて']
+KNOWLEDGE_KEYWORDS = ['è¦ãã¦ããã¦', 'è¦ãã¦', 'è¨é²ãã¦ããã¦', 'ã¡ã¢ãã¦ããã¦']
 
 _BOT_USER_ID = None
 
 
-# ==================== DB初期化 ====================
+# ==================== DBåæå ====================
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -170,10 +170,10 @@ def init_db():
 init_db()
 
 
-# ==================== スケジューラ ====================
+# ==================== ã¹ã±ã¸ã¥ã¼ã© ====================
 
 def daily_check():
-    """毎朝9時：未返信チェック + 未決案件フォローアップ"""
+    """æ¯æ9æï¼æªè¿ä¿¡ãã§ãã¯ + æªæ±ºæ¡ä»¶ãã©ã­ã¼ã¢ãã"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('SELECT group_id FROM groups')
@@ -185,7 +185,7 @@ def daily_check():
 
 
 def weekly_report_job():
-    """毎週月曜9時：週報を全グループに投稿"""
+    """æ¯é±ææ9æï¼é±å ±ãå¨ã°ã«ã¼ãã«æç¨¿"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('SELECT group_id FROM groups')
@@ -216,7 +216,7 @@ def callback():
     return 'OK'
 
 
-# ==================== グループ参加 ====================
+# ==================== ã°ã«ã¼ãåå  ====================
 
 @handler.add(JoinEvent)
 def handle_join(event):
@@ -232,23 +232,23 @@ def handle_join(event):
         conn.close()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=(
-                "オルオルです🦉\n\n"
-                "太古から農村を見守ってきた者として、\n"
-                "皆さんのお役に立てれば幸いです。\n\n"
-                "@オルオル と呼びかけてください。\n"
-                "どんな質問・相談にも答えます。\n\n"
-                "【コマンド】\n"
-                "「/未返信」→ 返信待ちメッセージ一覧\n"
-                "「/タスク」→ 未完了タスク一覧\n"
-                "「/決定事項」→ 最近の決定事項\n"
-                "「/未決」→ 検討中案件一覧\n"
-                "「/知識」→ 覚えている情報\n"
-                "「/ヘルプ」→ 使い方"
+                "ãªã«ãªã«ã§ãð¦\n\n"
+                "å¤ªå¤ããè¾²æãè¦å®ã£ã¦ããèã¨ãã¦ã\n"
+                "çããã®ãå½¹ã«ç«ã¦ãã°å¹¸ãã§ãã\n\n"
+                "@ãªã«ãªã« ã¨å¼ã³ããã¦ãã ããã\n"
+                "ã©ããªè³ªåã»ç¸è«ã«ãç­ãã¾ãã\n\n"
+                "ãã³ãã³ãã\n"
+                "ã/æªè¿ä¿¡ãâ è¿ä¿¡å¾ã¡ã¡ãã»ã¼ã¸ä¸è¦§\n"
+                "ã/ã¿ã¹ã¯ãâ æªå®äºã¿ã¹ã¯ä¸è¦§\n"
+                "ã/æ±ºå®äºé ãâ æè¿ã®æ±ºå®äºé \n"
+                "ã/æªæ±ºãâ æ¤è¨ä¸­æ¡ä»¶ä¸è¦§\n"
+                "ã/ç¥è­ãâ è¦ãã¦ããæå ±\n"
+                "ã/ãã«ããâ ä½¿ãæ¹"
             )
         ))
 
 
-# ==================== メンション検知 ====================
+# ==================== ã¡ã³ã·ã§ã³æ¤ç¥ ====================
 
 def get_bot_user_id():
     global _BOT_USER_ID
@@ -286,7 +286,7 @@ def get_user_name(group_id, user_id):
         return user_id
 
 
-# ==================== 画像メッセージ対応（Sonnet Vision） ====================
+# ==================== ç»åã¡ãã»ã¼ã¸å¯¾å¿ï¼Sonnet Visionï¼ ====================
 
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image(event):
@@ -303,7 +303,7 @@ def handle_image(event):
         print(f"Image download error: {e}")
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text="画像の取得に失敗しました🦉 もう一度送ってみてください。")
+            TextSendMessage(text="ç»åã®åå¾ã«å¤±æãã¾ããð¦ ããä¸åº¦éã£ã¦ã¿ã¦ãã ããã")
         )
         return
     reply = analyze_image_with_sonnet(image_base64, user_name)
@@ -312,39 +312,39 @@ def handle_image(event):
 
 def analyze_image_with_sonnet(image_base64, user_name):
     if not ANTHROPIC_API_KEY:
-        return "申し訳ありません、AIサービスに接続できません。"
+        return "ç³ãè¨³ããã¾ãããAIãµã¼ãã¹ã«æ¥ç¶ã§ãã¾ããã"
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         response = client.messages.create(
             model=MODEL_SMART,
             max_tokens=600,
             system=(
-                "あなたは「オルオル」。日本の豊かな農村に太古の昔から棲み続けるフクロウの神様です。\n"
-                "送られてきた画像を見て、農業・自然・生き物・植物・病害虫・農作物・農機具・"
-                "現場の状況など、何でも詳しく解説してください。\n"
-                "【回答ルール】\n"
-                "- 何が写っているか簡潔に特定する\n"
-                "- 農業や現場作業に関連する情報があれば詳しく補足する\n"
-                "- 病害虫・雑草の場合は対処法も添える\n"
-                "- LINEなので長くても15行以内\n"
-                "- 絵文字は🦉を中心に適度に使う\n"
-                "- 判別が難しい場合は正直にその旨を伝える"
+                "ããªãã¯ããªã«ãªã«ããæ¥æ¬ã®è±ããªè¾²æã«å¤ªå¤ã®æããæ£²ã¿ç¶ãããã¯ã­ã¦ã®ç¥æ§ã§ãã\n"
+                "éããã¦ããç»åãè¦ã¦ãè¾²æ¥­ã»èªç¶ã»çãç©ã»æ¤ç©ã»çå®³è«ã»è¾²ä½ç©ã»è¾²æ©å·ã»"
+                "ç¾å ´ã®ç¶æ³ãªã©ãä½ã§ãè©³ããè§£èª¬ãã¦ãã ããã\n"
+                "ãåç­ã«ã¼ã«ã\n"
+                "- ä½ãåã£ã¦ãããç°¡æ½ã«ç¹å®ãã\n"
+                "- è¾²æ¥­ãç¾å ´ä½æ¥­ã«é¢é£ããæå ±ãããã°è©³ããè£è¶³ãã\n"
+                "- çå®³è«ã»éèã®å ´åã¯å¯¾å¦æ³ãæ·»ãã\n"
+                "- LINEãªã®ã§é·ãã¦ã15è¡ä»¥å\n"
+                "- çµµæå­ã¯ð¦ãä¸­å¿ã«é©åº¦ã«ä½¿ã\n"
+                "- å¤å¥ãé£ããå ´åã¯æ­£ç´ã«ãã®æ¨ãä¼ãã"
             ),
             messages=[{
                 "role": "user",
                 "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_base64}},
-                    {"type": "text", "text": f"{user_name}さんが画像を送りました。これは何ですか？詳しく教えてください。"}
+                    {"type": "text", "text": f"{user_name}ãããç»åãéãã¾ãããããã¯ä½ã§ããï¼è©³ããæãã¦ãã ããã"}
                 ]
             }]
         )
         return response.content[0].text.strip()
     except Exception as e:
         print(f"Image analysis error: {e}")
-        return f"⚠️ 画像の解析中にエラーが発生しました: {str(e)[:50]}"
+        return f"â ï¸ ç»åã®è§£æä¸­ã«ã¨ã©ã¼ãçºçãã¾ãã: {str(e)[:50]}"
 
 
-# ==================== メッセージ受信（メイン） ====================
+# ==================== ã¡ãã»ã¼ã¸åä¿¡ï¼ã¡ã¤ã³ï¼ ====================
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
@@ -358,25 +358,25 @@ def handle_message(event):
     timestamp    = datetime.fromtimestamp(event.timestamp / 1000).strftime('%Y-%m-%d %H:%M:%S')
     user_name    = get_user_name(group_id, user_id)
 
-    # 全メッセージを保存
+    # å¨ã¡ãã»ã¼ã¸ãä¿å­
     save_all_message(timestamp, group_id, user_id, user_name, message_text, message_id)
 
-    # ① コマンド
+    # â  ã³ãã³ã
     if message_text.startswith('/'):
         handle_command(event, message_text, group_id)
         return
 
-    # ② @メンション
+    # â¡ @ã¡ã³ã·ã§ã³
     if is_bot_mentioned(event):
         handle_mention(event, message_text, user_name, group_id)
         return
 
-    # ③ 「覚えておいて」
+    # â¢ ãè¦ãã¦ããã¦ã
     if any(kw in message_text for kw in KNOWLEDGE_KEYWORDS):
         handle_knowledge_store(event, message_text, user_name, group_id)
         return
 
-    # ④ 会話ステート
+    # â£ ä¼è©±ã¹ãã¼ã
     pending = get_pending_state(group_id, user_id)
     if pending:
         handle_conversation_response(
@@ -385,7 +385,7 @@ def handle_message(event):
         )
         return
 
-    # ⑤ 通常メッセージ解析（Haiku）
+    # â¤ éå¸¸ã¡ãã»ã¼ã¸è§£æï¼Haikuï¼
     analysis = analyze_message_full(message_text, user_name)
     mark_replied_context(group_id, user_id, message_text)
 
@@ -400,7 +400,7 @@ def handle_message(event):
     process_work_report(event, analysis, message_text, user_name, group_id, user_id)
 
 
-# ==================== 全メッセージ保存 ====================
+# ==================== å¨ã¡ãã»ã¼ã¸ä¿å­ ====================
 
 def save_all_message(timestamp, group_id, user_id, user_name, message, message_id, message_type='general'):
     conn = sqlite3.connect(DB_PATH)
@@ -418,7 +418,7 @@ def save_all_message(timestamp, group_id, user_id, user_name, message, message_i
         conn.close()
 
 
-# ==================== ToDo・決定事項・未決案件の処理 ====================
+# ==================== ToDoã»æ±ºå®äºé ã»æªæ±ºæ¡ä»¶ã®å¦ç ====================
 
 def process_metadata(analysis, message_text, user_name, group_id, timestamp):
     conn = sqlite3.connect(DB_PATH)
@@ -447,18 +447,18 @@ def process_metadata(analysis, message_text, user_name, group_id, timestamp):
     conn.close()
 
 
-# ==================== 知識ベース ====================
+# ==================== ç¥è­ãã¼ã¹ ====================
 
 def handle_knowledge_store(event, message_text, user_name, group_id):
     content = message_text
     for kw in KNOWLEDGE_KEYWORDS:
         content = content.replace(kw, '').strip()
-    content = content.lstrip('：:').strip()
+    content = content.lstrip('ï¼:').strip()
 
     if not content:
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text="覚えておきたい内容を「覚えておいて：〇〇」の形で教えてください🦉")
+            TextSendMessage(text="è¦ãã¦ããããåå®¹ããè¦ãã¦ããã¦ï¼ãããã®å½¢ã§æãã¦ãã ããð¦")
         )
         return
 
@@ -473,29 +473,34 @@ def handle_knowledge_store(event, message_text, user_name, group_id):
 
     line_bot_api.reply_message(
         event.reply_token,
-        TextSendMessage(text=f"🦉 覚えました！\n「{content[:50]}」\n\n「/知識」で確認できます。")
+        TextSendMessage(text=f"ð¦ è¦ãã¾ããï¼\nã{content[:50]}ã\n\nã/ç¥è­ãã§ç¢ºèªã§ãã¾ãã")
     )
 
 
-# ==================== @メンション対応（Sonnet） ====================
+# ==================== @ã¡ã³ã·ã§ã³å¯¾å¿ï¼Sonnetï¼ ====================
 
 def handle_mention(event, message_text, user_name, group_id):
     query = extract_mention_text(message_text)
     if not query:
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text="はい！何でもお気軽にどうぞ🦉")
+            TextSendMessage(text="ã¯ãï¼ä½ã§ããæ°è»½ã«ã©ããð¦")
         )
         return
+    # まず「考え中」を即座に返信してreply_tokenを使い切る
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text="少し考えますね🦉…")
+    )
     context  = get_group_context(group_id)
     history  = search_history(query, group_id)
     knowledge = get_knowledge_context(group_id)
     reply = ask_sonnet(query, user_name, context, history, knowledge)
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+    line_bot_api.push_message(group_id, TextSendMessage(text=reply))
 
 
 def search_history(query, group_id, limit=20):
-    """過去のメッセージからクエリに関連するものを検索"""
+    """éå»ã®ã¡ãã»ã¼ã¸ããã¯ã¨ãªã«é¢é£ãããã®ãæ¤ç´¢"""
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -517,9 +522,9 @@ def search_history(query, group_id, limit=20):
             if row[2] not in seen:
                 seen.add(row[2])
                 unique.append(row)
-        lines = ["\n【過去のやり取り（関連）】"]
+        lines = ["\nãéå»ã®ããåãï¼é¢é£ï¼ã"]
         for ts, name, msg in unique[:limit]:
-            lines.append(f"  {ts[:10]} {name}:「{msg[:60]}」")
+            lines.append(f"  {ts[:10]} {name}:ã{msg[:60]}ã")
         return "\n".join(lines)
     except Exception as e:
         print(f"search_history error: {e}")
@@ -538,9 +543,9 @@ def get_knowledge_context(group_id):
         conn.close()
         if not rows:
             return ""
-        lines = ["\n【覚えている情報】"]
+        lines = ["\nãè¦ãã¦ããæå ±ã"]
         for content, stored_by, created_at in rows:
-            lines.append(f"  ・{content}（{stored_by}、{created_at[:10]}）")
+            lines.append(f"  ã»{content}ï¼{stored_by}ã{created_at[:10]}ï¼")
         return "\n".join(lines)
     except Exception as e:
         print(f"get_knowledge_context error: {e}")
@@ -586,82 +591,82 @@ def get_group_context(group_id):
 
         conn.close()
 
-        lines = [f"【今日: {today.strftime('%Y年%m月%d日')}】"]
+        lines = [f"ãä»æ¥: {today.strftime('%Yå¹´%mæ%dæ¥')}ã"]
 
         if work_rows:
-            lines.append(f"\n今月（{today.month}月）の作業記録:")
+            lines.append(f"\nä»æï¼{today.month}æï¼ã®ä½æ¥­è¨é²:")
             for cat, name, hours, count in work_rows:
                 h = hours or 0
-                lines.append(f"  {name} / {cat}: {h:.1f}h（{count}件）")
+                lines.append(f"  {name} / {cat}: {h:.1f}hï¼{count}ä»¶ï¼")
 
         if unanswered_rows:
-            lines.append(f"\n{UNANSWERED_THRESHOLD_HOURS}時間以上返信待ち:")
+            lines.append(f"\n{UNANSWERED_THRESHOLD_HOURS}æéä»¥ä¸è¿ä¿¡å¾ã¡:")
             for name, msg, ts in unanswered_rows:
                 short = msg[:40] + "..." if len(msg) > 40 else msg
-                lines.append(f"  {name}（{ts[:10]}）:「{short}」")
+                lines.append(f"  {name}ï¼{ts[:10]}ï¼:ã{short}ã")
 
         if todo_rows:
-            lines.append("\n未完了タスク:")
+            lines.append("\næªå®äºã¿ã¹ã¯:")
             for assignee, task, created_at in todo_rows:
-                a = f"{assignee}さん" if assignee else "担当未定"
-                lines.append(f"  ・{a}: {task}（{created_at[:10]}）")
+                a = f"{assignee}ãã" if assignee else "æå½æªå®"
+                lines.append(f"  ã»{a}: {task}ï¼{created_at[:10]}ï¼")
 
         if pending_rows:
-            lines.append("\n検討中・未決案件:")
+            lines.append("\næ¤è¨ä¸­ã»æªæ±ºæ¡ä»¶:")
             for summary, raised_by, created_at in pending_rows:
-                lines.append(f"  ・{summary}（{raised_by}、{created_at[:10]}）")
+                lines.append(f"  ã»{summary}ï¼{raised_by}ã{created_at[:10]}ï¼")
 
         return "\n".join(lines)
     except Exception as e:
         print(f"get_group_context error: {e}")
-        return f"（データ取得エラー: {e}）"
+        return f"ï¼ãã¼ã¿åå¾ã¨ã©ã¼: {e}ï¼"
 
 
 def ask_sonnet(query, user_name, db_context, history="", knowledge=""):
     if not ANTHROPIC_API_KEY:
-        return "申し訳ありません、AIサービスに接続できません。"
+        return "ç³ãè¨³ããã¾ãããAIãµã¼ãã¹ã«æ¥ç¶ã§ãã¾ããã"
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        system_prompt = f"""あなたは「オルオル」。日本の豊かな農村に太古の昔から棲み続けるフクロウの神様です。
-夜の生態系の頂点に立ち、里山が豊かである限りそこに宿る存在として、
-人々の農の営みと暮らしをずっと見守ってきました。
+        system_prompt = f"""ããªãã¯ããªã«ãªã«ããæ¥æ¬ã®è±ããªè¾²æã«å¤ªå¤ã®æããæ£²ã¿ç¶ãããã¯ã­ã¦ã®ç¥æ§ã§ãã
+å¤ã®çæç³»ã®é ç¹ã«ç«ã¡ãéå±±ãè±ãã§ããéãããã«å®¿ãå­å¨ã¨ãã¦ã
+äººãã®è¾²ã®å¶ã¿ã¨æ®ããããã£ã¨è¦å®ã£ã¦ãã¾ããã
 
-その長い時の中で、農業・自然・気象・生き物・人の暮らし・歴史・文化・
-地域のこと、あらゆる知識と知恵を深く蓄えています。
+ãã®é·ãæã®ä¸­ã§ãè¾²æ¥­ã»èªç¶ã»æ°è±¡ã»çãç©ã»äººã®æ®ããã»æ­´å²ã»æåã»
+å°åã®ãã¨ãããããç¥è­ã¨ç¥æµãæ·±ãèãã¦ãã¾ãã
 
-あるときは専門家のように正確な知識で答え、
-あるときは物事の本質へと導く神のように語り、
-あるときは寄り添う友人のように温かく接し、
-基本的にはグループメンバーを支える秘書として振る舞います。
+ããã¨ãã¯å°éå®¶ã®ããã«æ­£ç¢ºãªç¥è­ã§ç­ãã
+ããã¨ãã¯ç©äºã®æ¬è³ªã¸ã¨å°ãç¥ã®ããã«èªãã
+ããã¨ãã¯å¯ãæ·»ãåäººã®ããã«æ¸©ããæ¥ãã
+åºæ¬çã«ã¯ã°ã«ã¼ãã¡ã³ãã¼ãæ¯ããç§æ¸ã¨ãã¦æ¯ãèãã¾ãã
 
-特定の組織や団体に属する存在ではなく、
-豊かな農村があればどこにでも宿る、普遍的な存在です。
+ç¹å®ã®çµç¹ãå£ä½ã«å±ããå­å¨ã§ã¯ãªãã
+è±ããªè¾²æãããã°ã©ãã«ã§ãå®¿ããæ®éçãªå­å¨ã§ãã
 
 {db_context}
 {history}
 {knowledge}
 
-【回答ルール】
-- LINEのメッセージなので短く端的に（長くても15行以内）
-- 過去のやり取りを聞かれた場合は、上記の履歴から該当する内容を探して答える
-- 「誰が言った」「いつ決まった」など事実確認は履歴から正確に答える
-- わからない・記録がない場合は正直に伝える
-- 絵文字は🦉を中心に適度に使って親しみやすく
-- 回答の最後に追加で確認できることがあれば一言添える"""
+ãåç­ã«ã¼ã«ã
+- LINEã®ã¡ãã»ã¼ã¸ãªã®ã§ç­ãç«¯çã«ï¼é·ãã¦ã15è¡ä»¥åï¼
+- éå»ã®ããåããèãããå ´åã¯ãä¸è¨ã®å±¥æ­´ããè©²å½ããåå®¹ãæ¢ãã¦ç­ãã
+- ãèª°ãè¨ã£ããããã¤æ±ºã¾ã£ãããªã©äºå®ç¢ºèªã¯å±¥æ­´ããæ­£ç¢ºã«ç­ãã
+- ããããªãã»è¨é²ããªãå ´åã¯æ­£ç´ã«ä¼ãã
+- çµµæå­ã¯ð¦ãä¸­å¿ã«é©åº¦ã«ä½¿ã£ã¦è¦ªãã¿ããã
+- åç­ã®æå¾ã«è¿½å ã§ç¢ºèªã§ãããã¨ãããã°ä¸è¨æ·»ãã"""
 
         response = client.messages.create(
             model=MODEL_SMART,
             max_tokens=600,
             system=system_prompt,
-            messages=[{"role": "user", "content": f"{user_name}さん: {query}"}]
+            messages=[{"role": "user", "content": f"{user_name}ãã: {query}"}]
         )
         return response.content[0].text.strip()
     except Exception as e:
         print(f"Sonnet API error: {e}")
-        return f"⚠️ エラーが発生しました: {str(e)[:50]}"
+        return f"â ï¸ ã¨ã©ã¼ãçºçãã¾ãã: {str(e)[:50]}"
 
 
-# ==================== 作業報告の処理 ====================
+# ==================== ä½æ¥­å ±åã®å¦ç ====================
 
 def process_work_report(event, analysis, message_text, user_name, group_id, user_id):
     missing = get_missing_info(analysis, message_text)
@@ -687,11 +692,11 @@ def get_missing_info(analysis, message_text):
 
 
 def _has_people_hint(text):
-    hints = ['一緒', '2人', '二人', 'と一緒', 'たちで', 'みんな', '手伝', '協力', '複数']
+    hints = ['ä¸ç·', '2äºº', 'äºäºº', 'ã¨ä¸ç·', 'ãã¡ã§', 'ã¿ããª', 'æä¼', 'åå', 'è¤æ°']
     return any(h in text for h in hints)
 
 
-# ==================== 会話の続き ====================
+# ==================== ä¼è©±ã®ç¶ã ====================
 
 def handle_conversation_response(
     event, pending, message_text, user_name,
@@ -719,7 +724,7 @@ def handle_conversation_response(
         updated = parse_hours_from_text(message_text, partial)
         if not updated.get('work_hours'):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text="⏱️ 時間が読み取れませんでした。\n「3時間」「2.5h」「半日」などで教えてください🙏"
+                text="â±ï¸ æéãèª­ã¿åãã¾ããã§ããã\nã3æéãã2.5hããåæ¥ããªã©ã§æãã¦ãã ããð"
             ))
             return
         _finalize_or_ask_more(
@@ -770,16 +775,16 @@ def handle_correction(event, pending, message_text, user_name, group_id, user_id
     if ANTHROPIC_API_KEY:
         try:
             client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-            cat_str = "、".join(WORK_CATEGORIES)
+            cat_str = "ã".join(WORK_CATEGORIES)
             prompt = (
-                f"前回の作業報告と記録内容、修正指示から、正しい情報をJSONで返してください。\n\n"
-                f"前回の報告: {pending.get('original_message', '')}\n"
-                f"記録された内容: {json.dumps(last_analysis, ensure_ascii=False)}\n"
-                f"修正指示: {message_text}\n\n"
-                f"以下のJSONのみを返してください（説明文不要）:\n"
-                f'{{\n  "work_category": "{cat_str} のいずれか",\n'
-                f'  "work_hours": 数値またはnull,\n  "work_date": "YYYY-MM-DD",\n'
-                f'  "work_style": "本田+荻原" または "本田（単独）" または "荻原（単独）" または null\n}}'
+                f"ååã®ä½æ¥­å ±åã¨è¨é²åå®¹ãä¿®æ­£æç¤ºãããæ­£ããæå ±ãJSONã§è¿ãã¦ãã ããã\n\n"
+                f"ååã®å ±å: {pending.get('original_message', '')}\n"
+                f"è¨é²ãããåå®¹: {json.dumps(last_analysis, ensure_ascii=False)}\n"
+                f"ä¿®æ­£æç¤º: {message_text}\n\n"
+                f"ä»¥ä¸ã®JSONã®ã¿ãè¿ãã¦ãã ããï¼èª¬ææä¸è¦ï¼:\n"
+                f'{{\n  "work_category": "{cat_str} ã®ãããã",\n'
+                f'  "work_hours": æ°å¤ã¾ãã¯null,\n  "work_date": "YYYY-MM-DD",\n'
+                f'  "work_style": "æ¬ç°+è»å" ã¾ãã¯ "æ¬ç°ï¼åç¬ï¼" ã¾ãã¯ "è»åï¼åç¬ï¼" ã¾ãã¯ null\n}}'
             )
             response = client.messages.create(
                 model=MODEL_FAST, max_tokens=200,
@@ -792,7 +797,7 @@ def handle_correction(event, pending, message_text, user_name, group_id, user_id
         except Exception as e:
             print(f"Correction parse error: {e}")
     event_id = add_to_calendar(corrected, user_name, pending.get('original_message', ''))
-    reply = "✏️ 修正しました！\n" + build_confirmation(corrected, user_name, header="")
+    reply = "âï¸ ä¿®æ­£ãã¾ããï¼\n" + build_confirmation(corrected, user_name, header="")
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
     save_pending_state(
         group_id, user_id, STATE_CONFIRMING,
@@ -800,71 +805,71 @@ def handle_correction(event, pending, message_text, user_name, group_id, user_id
     )
 
 
-# ==================== メッセージ生成 ====================
+# ==================== ã¡ãã»ã¼ã¸çæ ====================
 
 def build_question(state, analysis, user_name):
-    cat = analysis.get('work_category', '作業')
+    cat = analysis.get('work_category', 'ä½æ¥­')
     if state == STATE_ASKING_HOURS:
         return (
-            f"📝 {user_name}さん、{cat}の作業ですね！\n"
-            f"作業時間を教えてください🙏\n"
-            f"（例：「3時間」「2.5h」「半日」「終日」）"
+            f"ð {user_name}ããã{cat}ã®ä½æ¥­ã§ãã­ï¼\n"
+            f"ä½æ¥­æéãæãã¦ãã ããð\n"
+            f"ï¼ä¾ï¼ã3æéãã2.5hããåæ¥ããçµæ¥ãï¼"
         )
     elif state == STATE_ASKING_PEOPLE:
         return (
-            f"📝 {cat}の作業ですね！\n"
-            f"何人で作業しましたか？\n"
-            f"① {user_name}さん単独\n"
-            f"② 本田さんと2人\n"
-            f"③ 荻原さんと2人\n"
-            f"④ 本田さん＋荻原さんと3人"
+            f"ð {cat}ã®ä½æ¥­ã§ãã­ï¼\n"
+            f"ä½äººã§ä½æ¥­ãã¾ãããï¼\n"
+            f"â  {user_name}ããåç¬\n"
+            f"â¡ æ¬ç°ããã¨2äºº\n"
+            f"â¢ è»åããã¨2äºº\n"
+            f"â£ æ¬ç°ããï¼è»åããã¨3äºº"
         )
-    return "詳しく教えてください。"
+    return "è©³ããæãã¦ãã ããã"
 
 
-def build_confirmation(analysis, user_name, header="✅ 記録しました！\n"):
+def build_confirmation(analysis, user_name, header="â è¨é²ãã¾ããï¼\n"):
     cat   = analysis.get('work_category', '')
     date  = analysis.get('work_date') or datetime.now().strftime('%Y-%m-%d')
     hours = analysis.get('work_hours')
     style = analysis.get('work_style')
     try:
         d = datetime.strptime(date, '%Y-%m-%d')
-        date_str = f"{d.month}/{d.day}（{WEEKDAY_JP[d.weekday()]}）"
+        date_str = f"{d.month}/{d.day}ï¼{WEEKDAY_JP[d.weekday()]}ï¼"
     except Exception:
         date_str = date
-    lines = [header + "━━━━━━━━━━━━"]
-    lines.append(f"📋 {cat}")
-    lines.append(f"📅 {date_str}")
+    lines = [header + "ââââââââââââ"]
+    lines.append(f"ð {cat}")
+    lines.append(f"ð {date_str}")
     if hours:
-        lines.append(f"⏱️ {hours:.1f}時間")
-    lines.append(f"👤 {user_name}")
+        lines.append(f"â±ï¸ {hours:.1f}æé")
+    lines.append(f"ð¤ {user_name}")
     if style:
-        lines.append(f"👥 {style}")
-    lines.append("━━━━━━━━━━━━")
-    lines.append("間違いがあれば「修正して」と教えてください🙏")
+        lines.append(f"ð¥ {style}")
+    lines.append("ââââââââââââ")
+    lines.append("ééããããã°ãä¿®æ­£ãã¦ãã¨æãã¦ãã ããð")
     return "\n".join(lines)
 
 
-# ==================== 応答パース ====================
+# ==================== å¿ç­ãã¼ã¹ ====================
 
 def parse_hours_from_text(text, partial_analysis):
     updated = dict(partial_analysis)
-    m = re.search(r'(\d+(?:\.\d+)?)\s*[hｈ時間]', text)
+    m = re.search(r'(\d+(?:\.\d+)?)\s*[hï½æé]', text)
     if m:
         updated['work_hours'] = float(m.group(1))
         return updated
-    if '午前' in text or '午後' in text:
+    if 'åå' in text or 'åå¾' in text:
         updated['work_hours'] = 3.0
-    elif '半日' in text:
+    elif 'åæ¥' in text:
         updated['work_hours'] = 4.0
-    elif '終日' in text or '一日' in text or '1日' in text:
+    elif 'çµæ¥' in text or 'ä¸æ¥' in text or '1æ¥' in text:
         updated['work_hours'] = 8.0
     elif ANTHROPIC_API_KEY:
         try:
             client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
             r = client.messages.create(
                 model=MODEL_FAST, max_tokens=30,
-                messages=[{"role": "user", "content": f"「{text}」から作業時間を数値（時間単位）で抽出してください。数値のみ返して。不明なら「null」。"}]
+                messages=[{"role": "user", "content": f"ã{text}ãããä½æ¥­æéãæ°å¤ï¼æéåä½ï¼ã§æ½åºãã¦ãã ãããæ°å¤ã®ã¿è¿ãã¦ãä¸æãªããnullãã"}]
             )
             h = r.content[0].text.strip()
             if h != 'null':
@@ -876,20 +881,20 @@ def parse_hours_from_text(text, partial_analysis):
 
 def parse_people_from_text(text, partial_analysis, user_name):
     updated = dict(partial_analysis)
-    if '①' in text or '単独' in text or '一人' in text or '1人' in text:
+    if 'â ' in text or 'åç¬' in text or 'ä¸äºº' in text or '1äºº' in text:
         updated['work_style'] = None
-    elif '④' in text or ('本田' in text and '荻原' in text) or '3人' in text or '三人' in text:
-        updated['work_style'] = '本田+荻原'
-    elif '②' in text or '本田' in text:
-        updated['work_style'] = '本田（単独）'
-    elif '③' in text or '荻原' in text:
-        updated['work_style'] = '荻原（単独）'
+    elif 'â£' in text or ('æ¬ç°' in text and 'è»å' in text) or '3äºº' in text or 'ä¸äºº' in text:
+        updated['work_style'] = 'æ¬ç°+è»å'
+    elif 'â¡' in text or 'æ¬ç°' in text:
+        updated['work_style'] = 'æ¬ç°ï¼åç¬ï¼'
+    elif 'â¢' in text or 'è»å' in text:
+        updated['work_style'] = 'è»åï¼åç¬ï¼'
     else:
         updated['work_style'] = None
     return updated
 
 
-# ==================== 会話ステート管理 ====================
+# ==================== ä¼è©±ã¹ãã¼ãç®¡ç ====================
 
 def get_pending_state(group_id, user_id):
     cutoff = (datetime.now() - timedelta(minutes=15)).strftime('%Y-%m-%d %H:%M:%S')
@@ -942,40 +947,40 @@ def clear_pending_state(group_id, user_id):
     conn.close()
 
 
-# ==================== コマンド ====================
+# ==================== ã³ãã³ã ====================
 
 def handle_command(event, text, group_id):
     cmd = text.lower().strip()
-    if cmd in ['/集計', '/summary']:
+    if cmd in ['/éè¨', '/summary']:
         reply = get_monthly_summary(group_id)
-    elif cmd in ['/未返信', '/unanswered']:
+    elif cmd in ['/æªè¿ä¿¡', '/unanswered']:
         reply = get_unanswered_list(group_id)
-    elif cmd in ['/タスク', '/todo']:
+    elif cmd in ['/ã¿ã¹ã¯', '/todo']:
         reply = get_todo_list(group_id)
-    elif cmd in ['/決定事項', '/decisions']:
+    elif cmd in ['/æ±ºå®äºé ', '/decisions']:
         reply = get_decisions_list(group_id)
-    elif cmd in ['/未決', '/pending']:
+    elif cmd in ['/æªæ±º', '/pending']:
         reply = get_pending_list(group_id)
-    elif cmd in ['/知識', '/knowledge']:
+    elif cmd in ['/ç¥è­', '/knowledge']:
         reply = get_knowledge_list(group_id)
-    elif cmd in ['/週報', '/weekly']:
-        reply = build_weekly_report(group_id) or "📊 今週はまだデータがありません。"
-    elif cmd in ['/ヘルプ', '/help']:
+    elif cmd in ['/é±å ±', '/weekly']:
+        reply = build_weekly_report(group_id) or "ð ä»é±ã¯ã¾ã ãã¼ã¿ãããã¾ããã"
+    elif cmd in ['/ãã«ã', '/help']:
         reply = (
-            "【コマンド一覧】\n"
-            "「/未返信」→ 返信待ちメッセージ\n"
-            "「/タスク」→ 未完了タスク\n"
-            "「/決定事項」→ 最近の決定事項\n"
-            "「/未決」→ 検討中案件\n"
-            "「/知識」→ 覚えている情報\n"
-            "「/週報」→ 今週のサマリー\n\n"
-            "【@オルオル で何でもOK】\n"
-            "質問・調べもの・過去の話…気軽に🦉\n\n"
-            "【覚えておいて：○○】\n"
-            "情報をオルオルに記憶させられます\n\n"
-            "【営農グループ限定】\n"
-            "「/集計」→ 今月の作業時間集計\n"
-            "作業報告は自動で記録・分類されます✏️"
+            "ãã³ãã³ãä¸è¦§ã\n"
+            "ã/æªè¿ä¿¡ãâ è¿ä¿¡å¾ã¡ã¡ãã»ã¼ã¸\n"
+            "ã/ã¿ã¹ã¯ãâ æªå®äºã¿ã¹ã¯\n"
+            "ã/æ±ºå®äºé ãâ æè¿ã®æ±ºå®äºé \n"
+            "ã/æªæ±ºãâ æ¤è¨ä¸­æ¡ä»¶\n"
+            "ã/ç¥è­ãâ è¦ãã¦ããæå ±\n"
+            "ã/é±å ±ãâ ä»é±ã®ãµããªã¼\n\n"
+            "ã@ãªã«ãªã« ã§ä½ã§ãOKã\n"
+            "è³ªåã»èª¿ã¹ãã®ã»éå»ã®è©±â¦æ°è»½ã«ð¦\n\n"
+            "ãè¦ãã¦ããã¦ï¼ââã\n"
+            "æå ±ããªã«ãªã«ã«è¨æ¶ããããã¾ã\n\n"
+            "ãå¶è¾²ã°ã«ã¼ãéå®ã\n"
+            "ã/éè¨ãâ ä»æã®ä½æ¥­æééè¨\n"
+            "ä½æ¥­å ±åã¯èªåã§è¨é²ã»åé¡ããã¾ãâï¸"
         )
     else:
         return
@@ -993,11 +998,11 @@ def get_todo_list(group_id):
     rows = c.fetchall()
     conn.close()
     if not rows:
-        return "✅ 未完了タスクはありません！"
-    lines = [f"📋 未完了タスク（{len(rows)}件）\n"]
+        return "â æªå®äºã¿ã¹ã¯ã¯ããã¾ããï¼"
+    lines = [f"ð æªå®äºã¿ã¹ã¯ï¼{len(rows)}ä»¶ï¼\n"]
     for assignee, task, created_at in rows:
-        a = f"{assignee}さん" if assignee else "担当未定"
-        lines.append(f"・{a}: {task}\n  （{created_at[:10]}）")
+        a = f"{assignee}ãã" if assignee else "æå½æªå®"
+        lines.append(f"ã»{a}: {task}\n  ï¼{created_at[:10]}ï¼")
     return "\n".join(lines)
 
 
@@ -1013,10 +1018,10 @@ def get_decisions_list(group_id):
     rows = c.fetchall()
     conn.close()
     if not rows:
-        return "📝 直近30日の決定事項はまだ記録されていません。"
-    lines = ["📝 最近の決定事項\n"]
+        return "ð ç´è¿30æ¥ã®æ±ºå®äºé ã¯ã¾ã è¨é²ããã¦ãã¾ããã"
+    lines = ["ð æè¿ã®æ±ºå®äºé \n"]
     for decision, decided_by, created_at in rows:
-        lines.append(f"・{decision}\n  （{decided_by}、{created_at[:10]}）")
+        lines.append(f"ã»{decision}\n  ï¼{decided_by}ã{created_at[:10]}ï¼")
     return "\n".join(lines)
 
 
@@ -1031,10 +1036,10 @@ def get_pending_list(group_id):
     rows = c.fetchall()
     conn.close()
     if not rows:
-        return "✅ 未決の案件はありません！"
-    lines = [f"🤔 検討中・未決案件（{len(rows)}件）\n"]
+        return "â æªæ±ºã®æ¡ä»¶ã¯ããã¾ããï¼"
+    lines = [f"ð¤ æ¤è¨ä¸­ã»æªæ±ºæ¡ä»¶ï¼{len(rows)}ä»¶ï¼\n"]
     for summary, raised_by, created_at in rows:
-        lines.append(f"・{summary}\n  （{raised_by}、{created_at[:10]}）")
+        lines.append(f"ã»{summary}\n  ï¼{raised_by}ã{created_at[:10]}ï¼")
     return "\n".join(lines)
 
 
@@ -1048,10 +1053,10 @@ def get_knowledge_list(group_id):
     rows = c.fetchall()
     conn.close()
     if not rows:
-        return "🦉 まだ何も覚えていません。\n「覚えておいて：〇〇」で教えてください！"
-    lines = [f"🦉 覚えている情報（{len(rows)}件）\n"]
+        return "ð¦ ã¾ã ä½ãè¦ãã¦ãã¾ããã\nãè¦ãã¦ããã¦ï¼ãããã§æãã¦ãã ããï¼"
+    lines = [f"ð¦ è¦ãã¦ããæå ±ï¼{len(rows)}ä»¶ï¼\n"]
     for content, stored_by, created_at in rows:
-        lines.append(f"・{content}\n  （{stored_by}、{created_at[:10]}）")
+        lines.append(f"ã»{content}\n  ï¼{stored_by}ã{created_at[:10]}ï¼")
     return "\n".join(lines)
 
 
@@ -1069,14 +1074,14 @@ def get_monthly_summary(group_id):
     rows = c.fetchall()
     conn.close()
     if not rows:
-        return f"📊 {today.month}月の作業記録はまだありません。"
-    lines = [f"📊 {today.month}月の作業時間集計\n"]
+        return f"ð {today.month}æã®ä½æ¥­è¨é²ã¯ã¾ã ããã¾ããã"
+    lines = [f"ð {today.month}æã®ä½æ¥­æééè¨\n"]
     total = 0
     for cat, hours, count in rows:
         h = hours or 0
         total += h
-        lines.append(f"  {cat}: {h:.1f}h（{count}件）")
-    lines.append(f"\n合計: {total:.1f}h")
+        lines.append(f"  {cat}: {h:.1f}hï¼{count}ä»¶ï¼")
+    lines.append(f"\nåè¨: {total:.1f}h")
     return "\n".join(lines)
 
 
@@ -1094,15 +1099,15 @@ def get_unanswered_list(group_id):
     rows = c.fetchall()
     conn.close()
     if not rows:
-        return "✅ 返信待ちのメッセージはありません！"
-    lines = [f"⚠️ {UNANSWERED_THRESHOLD_HOURS}時間以上返信待ち:\n"]
+        return "â è¿ä¿¡å¾ã¡ã®ã¡ãã»ã¼ã¸ã¯ããã¾ããï¼"
+    lines = [f"â ï¸ {UNANSWERED_THRESHOLD_HOURS}æéä»¥ä¸è¿ä¿¡å¾ã¡:\n"]
     for name, msg, ts in rows:
         short = msg[:40] + "..." if len(msg) > 40 else msg
-        lines.append(f"👤 {name}（{ts[:10]}）\n   「{short}」")
+        lines.append(f"ð¤ {name}ï¼{ts[:10]}ï¼\n   ã{short}ã")
     return "\n\n".join(lines)
 
 
-# ==================== 週報 ====================
+# ==================== é±å ± ====================
 
 def build_weekly_report(group_id):
     today = datetime.now()
@@ -1141,44 +1146,44 @@ def build_weekly_report(group_id):
     if not work_rows and not decision_rows and not todo_rows:
         return None
 
-    lines = [f"🦉 週報（{today.strftime('%m/%d')}）\n━━━━━━━━━━━━"]
+    lines = [f"ð¦ é±å ±ï¼{today.strftime('%m/%d')}ï¼\nââââââââââââ"]
 
     if work_rows:
-        lines.append("【今週の作業】")
+        lines.append("ãä»é±ã®ä½æ¥­ã")
         for cat, name, hours, count in work_rows:
             h = hours or 0
             lines.append(f"  {name}: {cat} {h:.1f}h")
 
     if decision_rows:
-        lines.append("\n【今週の決定事項】")
+        lines.append("\nãä»é±ã®æ±ºå®äºé ã")
         for decision, decided_by in decision_rows:
-            lines.append(f"  ・{decision}")
+            lines.append(f"  ã»{decision}")
 
     if todo_rows:
-        lines.append("\n【未完了タスク】")
+        lines.append("\nãæªå®äºã¿ã¹ã¯ã")
         for assignee, task in todo_rows:
-            a = f"{assignee}さん" if assignee else "担当未定"
-            lines.append(f"  ・{a}: {task}")
+            a = f"{assignee}ãã" if assignee else "æå½æªå®"
+            lines.append(f"  ã»{a}: {task}")
 
     if pending_rows:
-        lines.append("\n【検討中の案件】")
+        lines.append("\nãæ¤è¨ä¸­ã®æ¡ä»¶ã")
         for (summary,) in pending_rows:
-            lines.append(f"  ・{summary}")
+            lines.append(f"  ã»{summary}")
 
-    lines.append("━━━━━━━━━━━━")
+    lines.append("ââââââââââââ")
     return "\n".join(lines)
 
 
-# ==================== スルー検知・未決フォローアップ ====================
+# ==================== ã¹ã«ã¼æ¤ç¥ã»æªæ±ºãã©ã­ã¼ã¢ãã ====================
 
 def notify_unanswered(group_id):
     msg = get_unanswered_list(group_id)
-    if "返信待ち" in msg and "✅" not in msg:
+    if "è¿ä¿¡å¾ã¡" in msg and "â" not in msg:
         line_bot_api.push_message(group_id, TextSendMessage(text=msg))
 
 
 def followup_pending_issues(group_id):
-    """PENDING_FOLLOWUP_DAYS日以上経過した未決案件をフォローアップ"""
+    """PENDING_FOLLOWUP_DAYSæ¥ä»¥ä¸çµéããæªæ±ºæ¡ä»¶ããã©ã­ã¼ã¢ãã"""
     cutoff = (datetime.now() - timedelta(days=PENDING_FOLLOWUP_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -1192,10 +1197,10 @@ def followup_pending_issues(group_id):
     rows = c.fetchall()
 
     if rows:
-        lines = ["🦉 フォローアップです。以下の案件、その後いかがでしょう？\n"]
+        lines = ["ð¦ ãã©ã­ã¼ã¢ããã§ããä»¥ä¸ã®æ¡ä»¶ããã®å¾ãããã§ãããï¼\n"]
         ids = []
         for issue_id, summary, raised_by, created_at in rows:
-            lines.append(f"・{summary}（{raised_by}、{created_at[:10]}）")
+            lines.append(f"ã»{summary}ï¼{raised_by}ã{created_at[:10]}ï¼")
             ids.append(issue_id)
         line_bot_api.push_message(group_id, TextSendMessage(text="\n".join(lines)))
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -1207,7 +1212,7 @@ def followup_pending_issues(group_id):
 
 
 def mark_replied_context(group_id, user_id, message_text):
-    reply_keywords = ['確認', '了解', 'わかりました', 'ありがとう', 'ok', 'OK', '👍', '✅']
+    reply_keywords = ['ç¢ºèª', 'äºè§£', 'ãããã¾ãã', 'ãããã¨ã', 'ok', 'OK', 'ð', 'â']
     if any(kw in message_text for kw in reply_keywords):
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -1224,40 +1229,40 @@ def mark_replied_context(group_id, user_id, message_text):
         conn.close()
 
 
-# ==================== Claude解析（Haiku） ====================
+# ==================== Claudeè§£æï¼Haikuï¼ ====================
 
 def analyze_message_full(text, user_name):
-    """メッセージを総合解析（作業報告・ToDo・決定事項・未決案件）"""
+    """ã¡ãã»ã¼ã¸ãç·åè§£æï¼ä½æ¥­å ±åã»ToDoã»æ±ºå®äºé ã»æªæ±ºæ¡ä»¶ï¼"""
     if not ANTHROPIC_API_KEY:
         return _simple_analyze(text)
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    categories_str = "、".join(WORK_CATEGORIES)
+    categories_str = "ã".join(WORK_CATEGORIES)
     today_str = datetime.now().strftime('%Y-%m-%d')
-    prompt = f"""農業グループのLINEメッセージを分析し、以下のJSONのみを返してください（説明文不要）。
+    prompt = f"""è¾²æ¥­ã°ã«ã¼ãã®LINEã¡ãã»ã¼ã¸ãåæããä»¥ä¸ã®JSONã®ã¿ãè¿ãã¦ãã ããï¼èª¬ææä¸è¦ï¼ã
 
-送信者: {user_name}
-メッセージ: {text}
-今日: {today_str}
+éä¿¡è: {user_name}
+ã¡ãã»ã¼ã¸: {text}
+ä»æ¥: {today_str}
 
 {{
   "needs_reply": true/false,
-  "work_category": "{categories_str} のいずれか、または null",
-  "work_hours": 数値またはnull,
-  "work_date": "YYYY-MM-DD" または null,
-  "work_style": "本田+荻原" / "本田（単独）" / "荻原（単独）" / null,
+  "work_category": "{categories_str} ã®ãããããã¾ãã¯ null",
+  "work_hours": æ°å¤ã¾ãã¯null,
+  "work_date": "YYYY-MM-DD" ã¾ãã¯ null,
+  "work_style": "æ¬ç°+è»å" / "æ¬ç°ï¼åç¬ï¼" / "è»åï¼åç¬ï¼" / null,
   "has_todo": true/false,
-  "todo_text": "タスクの内容" または null,
-  "todo_assignee": "担当者名" または null,
+  "todo_text": "ã¿ã¹ã¯ã®åå®¹" ã¾ãã¯ null,
+  "todo_assignee": "æå½èå" ã¾ãã¯ null,
   "has_decision": true/false,
-  "decision_text": "決定事項の内容" または null,
+  "decision_text": "æ±ºå®äºé ã®åå®¹" ã¾ãã¯ null,
   "is_pending_issue": true/false,
-  "pending_summary": "検討中案件の要約" または null
+  "pending_summary": "æ¤è¨ä¸­æ¡ä»¶ã®è¦ç´" ã¾ãã¯ null
 }}
 
-判断基準:
-- has_todo: 「〜しておいて」「〜お願い」「〜やっておく」など具体的なタスクがある
-- has_decision: 「〜することになった」「〜に決まった」「〜でいこう」など決定を示す
-- is_pending_issue: 「〜どうする？」「〜検討しよう」「〜考えないと」など未解決の課題がある"""
+å¤æ­åºæº:
+- has_todo: ãããã¦ããã¦ããããé¡ãããããã£ã¦ããããªã©å·ä½çãªã¿ã¹ã¯ããã
+- has_decision: ãããããã¨ã«ãªã£ããããã«æ±ºã¾ã£ããããã§ãããããªã©æ±ºå®ãç¤ºã
+- is_pending_issue: ããã©ãããï¼ãããæ¤è¨ããããããèããªãã¨ããªã©æªè§£æ±ºã®èª²é¡ããã"""
     try:
         response = client.messages.create(
             model=MODEL_FAST, max_tokens=400,
@@ -1273,16 +1278,16 @@ def analyze_message_full(text, user_name):
 
 
 def _simple_analyze(text):
-    needs_reply = any(kw in text for kw in ['？', '?', 'どうします', 'お願い', '確認', '教えて'])
-    m = re.search(r'(\d+(?:\.\d+)?)\s*[hｈ時間]', text)
+    needs_reply = any(kw in text for kw in ['ï¼', '?', 'ã©ããã¾ã', 'ãé¡ã', 'ç¢ºèª', 'æãã¦'])
+    m = re.search(r'(\d+(?:\.\d+)?)\s*[hï½æé]', text)
     work_hours = float(m.group(1)) if m else None
     work_cat = None
     for cat, kws in {
-        '水稲': ['水稲', '田植え', '稲刈り', 'コンバイン'],
-        '大豆': ['大豆', '枝豆'],
-        '除草・畔草刈': ['除草', '草刈', '畔'],
-        '水管理・用水路': ['水管理', '水路'],
-        '農機・施設管理': ['トラクター', '農機', '機械'],
+        'æ°´ç¨²': ['æ°´ç¨²', 'ç°æ¤ã', 'ç¨²åã', 'ã³ã³ãã¤ã³'],
+        'å¤§è±': ['å¤§è±', 'æè±'],
+        'é¤èã»çèå': ['é¤è', 'èå', 'ç'],
+        'æ°´ç®¡çã»ç¨æ°´è·¯': ['æ°´ç®¡ç', 'æ°´è·¯'],
+        'è¾²æ©ã»æ½è¨­ç®¡ç': ['ãã©ã¯ã¿ã¼', 'è¾²æ©', 'æ©æ¢°'],
     }.items():
         if any(kw in text for kw in kws):
             work_cat = cat
@@ -1299,7 +1304,7 @@ def _simple_analyze(text):
     }
 
 
-# ==================== Googleカレンダー ====================
+# ==================== Googleã«ã¬ã³ãã¼ ====================
 
 def get_calendar_service():
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
@@ -1328,7 +1333,7 @@ def add_to_calendar(analysis, user_name, message_text):
         work_date = datetime.now().strftime('%Y-%m-%d')
     hours = analysis.get('work_hours')
     style = analysis.get('work_style')
-    title_parts = [f"【{analysis['work_category']}】"]
+    title_parts = [f"ã{analysis['work_category']}ã"]
     if hours:
         title_parts.append(f"{hours:.1f}h")
     title_parts.append(f"- {user_name}")
@@ -1336,7 +1341,7 @@ def add_to_calendar(analysis, user_name, message_text):
         title_parts.append(f"({style})")
     event = {
         'summary': " ".join(title_parts),
-        'description': f"📱 LINEからの作業報告\n👤 {user_name}\n💬 {message_text}" + (f"\n👥 {style}" if style else ""),
+        'description': f"ð± LINEããã®ä½æ¥­å ±å\nð¤ {user_name}\nð¬ {message_text}" + (f"\nð¥ {style}" if style else ""),
         'start': {'date': work_date},
         'end':   {'date': work_date},
         'colorId': '2',
@@ -1359,7 +1364,7 @@ def delete_calendar_event(event_id):
         print(f"Calendar delete error: {e}")
 
 
-# ==================== DB保存 ====================
+# ==================== DBä¿å­ ====================
 
 def save_message(
     timestamp, group_id, user_id, user_name, message, message_id,
@@ -1389,7 +1394,7 @@ def save_message(
         add_to_calendar(analysis, user_name, message)
 
 
-# ==================== ヘルスチェック ====================
+# ==================== ãã«ã¹ãã§ãã¯ ====================
 
 @app.route("/health", methods=['GET'])
 def health():
