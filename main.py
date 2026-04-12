@@ -318,6 +318,12 @@ def get_bot_user_id():
 
 
 def is_bot_mentioned(event):
+    # 自然な「オルオル」呼びかけを検知（@メンション不要）
+    BOT_NAMES = ['オルオル', 'おるおる']
+    text = getattr(event.message, 'text', '') or ''
+    if any(name in text for name in BOT_NAMES):
+        return True
+    # 公式@メンションも検知
     try:
         msg = event.message
         if hasattr(msg, 'mention') and msg.mention:
@@ -332,7 +338,11 @@ def is_bot_mentioned(event):
 
 
 def extract_mention_text(text):
-    return re.sub(r'@\S+\s*', '', text).strip()
+    # @メンションを除去
+    text = re.sub(r'@\S+\s*', '', text).strip()
+    # 「オルオル、」「オルオル！」などの自然な呼びかけを先頭から除去
+    text = re.sub(r'^[オお][ルる][オお][ルる][、。！？!?,\s]*', '', text).strip()
+    return text
 
 
 def get_user_name(group_id, user_id):
@@ -532,13 +542,13 @@ def handle_message(event):
         handle_mention(event, message_text, user_name, group_id)
         return
 
-    # ③ 「覚えておいて：内容」形式のみ反応（単なる会話での誤検知を防ぐ）
+    # ③ 「覚えておいて」系キーワード検知（文脈で判断）
     if any(kw in message_text for kw in KNOWLEDGE_KEYWORDS):
-        has_content = any(
-            (kw + '：') in message_text or (kw + ':') in message_text
-            for kw in KNOWLEDGE_KEYWORDS
-        )
-        if has_content:
+        # キーワードを除いて内容があれば記録（「覚えておいて！」だけは無視）
+        stripped = message_text
+        for kw in KNOWLEDGE_KEYWORDS:
+            stripped = stripped.replace(kw, '').replace('：', '').replace(':', '')
+        if stripped.strip().rstrip('！!。、？?').strip():
             handle_knowledge_store(event, message_text, user_name, group_id)
             return
 
