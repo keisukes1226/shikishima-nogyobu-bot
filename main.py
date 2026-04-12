@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage, JoinEvent, ImageMessage
+from linebot.models import MessageEvent, TextMessage, TextSendMessage, JoinEvent, ImageMessage, FileMessage
 import anthropic
 from apscheduler.schedulers.background import BackgroundScheduler
 from googleapiclient.discovery import build
@@ -308,6 +308,105 @@ def handle_image(event):
         return
     reply = analyze_image_with_sonnet(image_base64, user_name)
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+
+
+# ==================== ファイル対応（txt/pdf/docx/xlsx/csv） ====================
+
+def extract_file_text(file_bytes, filename):
+    """ファイル種別に応じてテキストを抽出する"""
+    import io, csv
+    ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
+    try:
+        if ext == 'txt':
+            try:
+                return file_bytes.decode('utf-8')
+            except UnicodeDecodeError:
+                return file_bytes.decode('shift_jis', errors='replace')
+        elif ext == 'pdf':
+            import pdfplumber
+            parts = []
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                for page in pdf.pages:
+                    t = page.extract_text()
+                    if t:
+                        parts.append(t)
+            return '\n'.join(parts) if parts else '（PDFからテキストを抽出できませんでした）'
+        elif ext == 'docx':
+            from docx import Document
+            doc = Document(io.BytesIO(file_bytes))
+            return '\n'.join(p.text for p in doc.paragraphs if p.text.strip())
+        elif ext in ('xlsx', 'xls'):
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+            parts = []
+            for sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                parts.append(f'【シート: {sheet_name}】')
+                for row in ws.iter_rows(values_only=True):
+                    row_text = '\t'.join(str(c) if c is not None else '' for c in row)
+                    if row_text.strip():
+                        parts.append(row_text)
+            return '\n'.join(parts)
+        elif ext == 'csv':
+            try:
+                text = file_bytes.decode('utf-8')
+            except UnicodeDecodeError:
+                text = file_bytes.decode('shift_jis', errors='replace')
+            reader = csv.reader(io.StringIO(text))
+            return '\n'.join('\t'.join(row) for row in reader)
+        else:
+            return f'（未対応の形式です: .{ext}）'
+    except Exception as e:
+        return f'（読み込みエラー: {e}）'
+
+
+@handler.add(MessageEvent, message=FileMessage)
+def handle_file(event):
+    if event.source.type != 'group':
+        return
+    group_id  = event.source.group_id
+    user_id   = event.source.user_id
+    user_name = get_user_name(group_id, user_id)
+    filename  = event.message.file_name
+
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=f'「{filename}」を確認しますね🦉…')
+    )
+
+    try:
+        message_content = line_bot_api.get_message_content(event.message.id)
+        file_bytes = b''.join(chunk for chunk in message_content.iter_content())
+    except Exception as e:
+        print(f"File download error: {e}")
+        line_bot_api.push_message(group_id, TextSendMessage(text='ファイルの取得に失敗しました🦉 もう一度送ってみてください。'))
+        return
+
+    file_text = extract_file_text(file_bytes, filename)
+    if not file_text.strip():
+        line_bot_api.push_message(group_id, TextSendMessage(text=f'「{filename}」からテキストを読み取れませんでした🦉'))
+        return
+
+    MAX_CHARS = 8000
+    truncated_note = ''
+    if len(file_text) > MAX_CHARS:
+        file_text = file_text[:MAX_CHARS]
+        truncated_note = f'\n\n※ファイルが長いため最初の{MAX_CHARS}文字のみ読み込みました。'
+
+    prompt = f"""{user_name}さんが「{filename}」というファイルを共有しました。
+内容を確認して要点をまとめてください。
+
+--- ファイル内容 ---
+{file_text}
+--- 以上 ---"""
+
+    context  = get_group_context(group_id)
+    history  = search_history(filename, group_id)
+    knowledge = get_knowledge_context(group_id)
+    reply = ask_sonnet(prompt, user_name, context, history, knowledge)
+    line_bot_api.push_message(group_id, TextSendMessage(text=reply + truncated_note))
+
+
 
 
 def analyze_image_with_sonnet(image_base64, user_name):
