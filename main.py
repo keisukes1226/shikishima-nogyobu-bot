@@ -210,9 +210,21 @@ def callback():
     signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
     try:
+        payload = json.loads(body)
+        for ev in payload.get('events', []):
+            msg_type = ev.get('message', {}).get('type', '')
+            ev_type = ev.get('type', '')
+            print(f"[WEBHOOK] ev={ev_type} msg={msg_type}", flush=True)
+            if ev_type == 'message' and msg_type == 'file':
+                handle_file_raw(ev)
+    except Exception as e:
+        print(f"[WEBHOOK ERR] {e}", flush=True)
+    try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
+    except Exception as e:
+        print(f"[HANDLER ERR] {e}", flush=True)
     return 'OK'
 
 
