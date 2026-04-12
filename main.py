@@ -36,7 +36,8 @@ ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-DB_PATH = os.environ.get('DB_PATH', 'messages.db')
+_data_dir = '/data' if os.path.isdir('/data') else '/tmp'
+DB_PATH = os.environ.get('DB_PATH', os.path.join(_data_dir, 'messages.db'))
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '')
 GOOGLE_CALENDAR_ID = os.environ.get('GOOGLE_CALENDAR_ID', 'primary')
 
@@ -63,7 +64,7 @@ CORRECTION_KEYWORDS = [
     '取り消し', '削除', '消して', '直して', '変えて', 'ちょっと待って'
 ]
 
-KNOWLEDGE_KEYWORDS = ['覚えておいて', '覚えて', '記録しておいて', 'メモしておいて']
+KNOWLEDGE_KEYWORDS = ['覚えておいて', '記録しておいて', 'メモしておいて']
 
 _BOT_USER_ID = None
 
@@ -100,7 +101,7 @@ def init_db():
     ''')
     c.execute('''
         CREATE TABLE IF NOT EXISTS groups (
-            group_id TEXT PRIMARY KEY, group_name TEXT, joined_at TEXT
+            group_id TEXT PRIMARY KEY, group_name TEXT, joined_at TEXT, scheduler_enabled INTEGER DEFAULT 1
         )
     ''')
     c.execute('''
@@ -220,7 +221,7 @@ def daily_check():
     """毎朝9時：未返信チェック + 未決案件フォローアップ"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('SELECT group_id FROM groups')
+    c.execute('SELECT group_id FROM groups WHERE scheduler_enabled = 1')
     groups = [row[0] for row in c.fetchall()]
     conn.close()
     for gid in groups:
@@ -232,7 +233,7 @@ def weekly_report_job():
     """毎週月曜9時：週報を全グループに投稿"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('SELECT group_id FROM groups')
+    c.execute('SELECT group_id FROM groups WHERE scheduler_enabled = 1')
     groups = [row[0] for row in c.fetchall()]
     conn.close()
     for gid in groups:
@@ -531,10 +532,15 @@ def handle_message(event):
         handle_mention(event, message_text, user_name, group_id)
         return
 
-    # ③ 「覚えておいて」
+    # ③ 「覚えておいて：内容」形式のみ反応（単なる会話での誤検知を防ぐ）
     if any(kw in message_text for kw in KNOWLEDGE_KEYWORDS):
-        handle_knowledge_store(event, message_text, user_name, group_id)
-        return
+        has_content = any(
+            (kw + '：') in message_text or (kw + ':') in message_text
+            for kw in KNOWLEDGE_KEYWORDS
+        )
+        if has_content:
+            handle_knowledge_store(event, message_text, user_name, group_id)
+            return
 
     # ④ 会話ステート
     pending = get_pending_state(group_id, user_id)
@@ -725,7 +731,10 @@ def handle_mention(event, message_text, user_name, group_id):
     history  = search_history(query, group_id)
     knowledge = get_knowledge_context(group_id)
     reply = ask_sonnet(query, user_name, context, history, knowledge)
-    line_bot_api.push_message(group_id, TextSendMessage(text=reply))
+    try:
+        line_bot_api.push_message(group_id, TextSendMessage(text=reply))
+    except Exception as e:
+        print(f"[PUSH ERROR] {e}", flush=True)
 
 
 def search_history(query, group_id, limit=20):
@@ -1194,6 +1203,20 @@ def handle_command(event, text, group_id):
         reply = get_knowledge_list(group_id)
     elif cmd in ['/週報', '/weekly']:
         reply = build_weekly_report(group_id) or "📊 今週はまだデータがありません。"
+    elif cmd in ['/スケジューラoff', '/scheduler off', '/scheduleroff']:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('UPDATE groups SET scheduler_enabled = 0 WHERE group_id = ?', (group_id,))
+        conn.commit()
+        conn.close()
+        reply = 'このグループへの朝・週次レポートを停止しました🦉'
+    elif cmd in ['/スケジューラon', '/scheduler on', '/scheduleron']:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('UPDATE groups SET scheduler_enabled = 1 WHERE group_id = ?', (group_id,))
+        conn.commit()
+        conn.close()
+        reply = 'このグループへの朝・週次レポートを再開します🦉'
     elif cmd in ['/ヘルプ', '/help']:
         reply = (
             "【コマンド一覧】\n"
@@ -1202,7 +1225,9 @@ def handle_command(event, text, group_id):
             "「/決定事項」→ 最近の決定事項\n"
             "「/未決」→ 検討中案件\n"
             "「/知識」→ 覚えている情報\n"
-            "「/週報」→ 今週のサマリー\n\n"
+            "「/週報」→ 今週のサマリー\n"
+            "「/スケジューラoff」→ 朝・週次レポート停止\n"
+            "「/スケジューラon」→ 朝・週次レポート再開\n\n"
             "【@オルオル で何でもOK】\n"
             "質問・調べもの・過去の話…気軽に🦉\n\n"
             "【覚えておいて：○○】\n"
