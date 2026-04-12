@@ -36,7 +36,7 @@ ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-_data_dir = '/data' if os.path.isdir('/data') else '/tmp'
+_data_dir = '/data' if os.path.isdir('/data') else '/tmp'  # Railway永続ボリューム対応
 DB_PATH = os.environ.get('DB_PATH', os.path.join(_data_dir, 'messages.db'))
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '')
 GOOGLE_CALENDAR_ID = os.environ.get('GOOGLE_CALENDAR_ID', 'primary')
