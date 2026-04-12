@@ -360,6 +360,58 @@ def extract_file_text(file_bytes, filename):
         return f'（読み込みエラー: {e}）'
 
 
+def handle_file_raw(ev):
+    """SDKのFileMessage dispatchを使わずRAWイベントから直接ファイルを処理"""
+    source = ev.get('source', {})
+    if source.get('type') != 'group':
+        return
+    group_id  = source.get('groupId', '')
+    user_id   = source.get('userId', '')
+    msg       = ev.get('message', {})
+    filename  = msg.get('fileName', 'unknown')
+    message_id = msg.get('id', '')
+    reply_token = ev.get('replyToken', '')
+    user_name = get_user_name(group_id, user_id)
+
+    print(f"[FILE RAW] group={group_id} user={user_name} file={filename}", flush=True)
+
+    # 受信確認をreply
+    try:
+        line_bot_api.reply_message(
+            reply_token,
+            TextSendMessage(text=f'「{filename}」を確認しますね🦉…')
+        )
+    except Exception as e:
+        print(f"[FILE RAW] reply error: {e}", flush=True)
+
+    # ファイルをダウンロード
+    try:
+        message_content = line_bot_api.get_message_content(message_id)
+        file_bytes = b''.join(chunk for chunk in message_content.iter_content())
+    except Exception as e:
+        print(f"[FILE RAW] download error: {e}", flush=True)
+        line_bot_api.push_message(group_id, TextSendMessage(text='ファイルの取得に失敗しました🦉 もう一度送ってみてください。'))
+        return
+
+    file_text = extract_file_text(file_bytes, filename)
+    if not file_text.strip():
+        line_bot_api.push_message(group_id, TextSendMessage(text=f'「{filename}」からテキストを読み取れませんでした🦉'))
+        return
+
+    MAX_CHARS = 8000
+    truncated_note = ''
+    if len(file_text) > MAX_CHARS:
+        file_text = file_text[:MAX_CHARS]
+        truncated_note = f'\n\n※ファイルが長いため最初の{MAX_CHARS}文字のみ読み込みました。'
+
+    prompt = f"""{user_name}さんが「{filename}」というファイルを共有しました。\n内容を確認して要点をまとめてください。\n\n--- ファイル内容 ---\n{file_text}\n--- 以上 ---"""
+    context   = get_group_context(group_id)
+    history   = search_history(filename, group_id)
+    knowledge = get_knowledge_context(group_id)
+    reply = ask_sonnet(prompt, user_name, context, history, knowledge)
+    line_bot_api.push_message(group_id, TextSendMessage(text=reply + truncated_note))
+
+
 @handler.add(MessageEvent, message=FileMessage)
 def handle_file(event):
     if event.source.type != 'group':
