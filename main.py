@@ -9,7 +9,7 @@
 - @メンションには何でも回答（Sonnet）
 - 画像を送ると内容を解析・説明（Sonnet Vision）
 - 毎朝9時：スルー検知・未決フォローアップ
-- 毎週月曜：週報自動投稿
+- 毎週月曜：週報自動投
 - Googleカレンダーに作業記録を転記
 """
 
@@ -40,8 +40,8 @@ DB_PATH = os.environ.get('DB_PATH', 'messages.db')
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '')
 GOOGLE_CALENDAR_ID = os.environ.get('GOOGLE_CALENDAR_ID', 'primary')
 
-MODEL_FAST  = "claude-3-haiku-20240307"
-MODEL_SMART = "claude-3-5-sonnet-20241022"
+MODEL_FAST  = "claude-haiku-4-5-20251001"
+MODEL_SMART = "claude-sonnet-4-20250514"
 
 WORK_CATEGORIES = [
     "水稲", "大豆", "野菜", "農機・施設管理", "除草・畔草刈",
