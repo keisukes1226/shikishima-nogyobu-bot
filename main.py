@@ -161,9 +161,16 @@ def init_db():
             content TEXT NOT NULL,
             stored_by TEXT,
             created_at TEXT,
-            tag TEXT
+            tag TEXT,
+            scope TEXT DEFAULT 'group'
         )
     ''')
+    # 既存DBにscopeカラムがない場合は追加（マイグレーション）
+    try:
+        c.execute("ALTER TABLE knowledge ADD COLUMN scope TEXT DEFAULT 'group'")
+        conn.commit()
+    except Exception:
+        pass  # すでに存在する場合はスキップ
     c.execute('''
         CREATE TABLE IF NOT EXISTS recent_media (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -332,7 +339,8 @@ def handle_join(event):
                 "「/タスク」→ 未完了タスク一覧\n"
                 "「/決定事項」→ 最近の決定事項\n"
                 "「/未決」→ 検討中案件一覧\n"
-                "「/知識」→ 覚えている情報\n"
+                "「/知識」→ このグループ専用の知識🔒\n"
+                "「/共通知識」→ 全グループ共通の知識🌐\n"
                 "「/ヘルプ」→ 使い方"
             )
         ))
@@ -645,8 +653,19 @@ def process_metadata(analysis, message_text, user_name, group_id, timestamp):
 
 # ==================== 知識ベース ====================
 
+SHARED_KNOWLEDGE_KEYWORDS = ['共通で', '全グループで', 'みんなで覚えて', '共通知識として', '全体で覚えて']
+
 def handle_knowledge_store(event, message_text, user_name, group_id):
     content = message_text
+
+    # scopeの判定（「共通で覚えておいて」→ shared）
+    scope = 'group'
+    for sk in SHARED_KNOWLEDGE_KEYWORDS:
+        if sk in content:
+            scope = 'shared'
+            content = content.replace(sk, '').strip()
+            break
+
     for kw in KNOWLEDGE_KEYWORDS:
         content = content.replace(kw, '').strip()
     content = content.lstrip('：:').strip()
@@ -654,22 +673,29 @@ def handle_knowledge_store(event, message_text, user_name, group_id):
     if not content:
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text="覚えておきたい内容を「覚えておいて：〇〇」の形で教えてください🦉")
+            TextSendMessage(text="覚えておきたい内容を「覚えておいて：〇〇」の形で教えてください🦉\n全グループ共通で覚えたい場合は「共通で覚えておいて：〇〇」")
         )
         return
 
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        'INSERT INTO knowledge (group_id, content, stored_by, created_at) VALUES (?, ?, ?, ?)',
-        (group_id, content, user_name, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        'INSERT INTO knowledge (group_id, content, stored_by, created_at, scope) VALUES (?, ?, ?, ?, ?)',
+        (group_id, content, user_name, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), scope)
     )
     conn.commit()
     conn.close()
 
+    if scope == 'shared':
+        scope_label = "【全グループ共通】"
+        cmd_hint = "「/共通知識」で確認できます。"
+    else:
+        scope_label = "【このグループ専用】"
+        cmd_hint = "「/知識」で確認できます。"
+
     line_bot_api.reply_message(
         event.reply_token,
-        TextSendMessage(text=f"🦉 覚えました！\n「{content[:50]}」\n\n「/知識」で確認できます。")
+        TextSendMessage(text=f"🦉 覚えました！{scope_label}\n「{content[:50]}」\n\n{cmd_hint}")
     )
 
 
@@ -874,22 +900,24 @@ def get_knowledge_context(group_id):
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
+        # このグループ専用 + 全グループ共通の両方を取得
         c.execute('''
-            SELECT content, stored_by, created_at FROM knowledge
-            WHERE group_id=? ORDER BY created_at DESC LIMIT 20
+            SELECT content, stored_by, created_at, scope FROM knowledge
+            WHERE (group_id=? AND scope='group') OR scope='shared'
+            ORDER BY scope ASC, created_at DESC LIMIT 30
         ''', (group_id,))
         rows = c.fetchall()
         conn.close()
         if not rows:
             return ""
         lines = ["\n【覚えている情報】"]
-        for content, stored_by, created_at in rows:
-            lines.append(f"  ・{content}（{stored_by}、{created_at[:10]}）")
+        for content, stored_by, created_at, scope in rows:
+            label = "🌐共通" if scope == 'shared' else "🔒専用"
+            lines.append(f"  ・[{label}] {content}（{stored_by}、{created_at[:10]}）")
         return "\n".join(lines)
     except Exception as e:
         print(f"get_knowledge_context error: {e}")
         return ""
-
 
 def get_group_context(group_id):
     try:
@@ -1308,6 +1336,8 @@ def handle_command(event, text, group_id):
     elif cmd in ['/未決', '/pending']:
         reply = get_pending_list(group_id)
     elif cmd in ['/知識', '/knowledge']:
+    elif cmd in ['/共通知識', '/shared']:
+        reply = get_shared_knowledge_list()
         reply = get_knowledge_list(group_id)
     elif cmd in ['/週報', '/weekly']:
         reply = build_weekly_report(group_id) or "📊 今週はまだデータがありません。"
@@ -1332,14 +1362,14 @@ def handle_command(event, text, group_id):
             "「/タスク」→ 未完了タスク\n"
             "「/決定事項」→ 最近の決定事項\n"
             "「/未決」→ 検討中案件\n"
-            "「/知識」→ 覚えている情報\n"
-            "「/週報」→ 今週のサマリー\n"
-            "「/スケジューラoff」→ 朝・週次レポート停止\n"
-            "「/スケジューラon」→ 朝・週次レポート再開\n\n"
+            "「/知識」→ このグループ専用の知識🔒\n"
+            "「/共通知識」→ 全グループ共通の知識🌐\n"
+            "「/週報」→ 今週のサマリー\n\n"
             "【@オルオル で何でもOK】\n"
             "質問・調べもの・過去の話…気軽に🦉\n\n"
-            "【覚えておいて：○○】\n"
-            "情報をオルオルに記憶させられます\n\n"
+            "【知識の記憶】\n"
+            "「覚えておいて：○○」→ このグループ専用🔒\n"
+            "「共通で覚えておいて：○○」→ 全グループ共通🌐\n\n"
             "【営農グループ限定】\n"
             "「/集計」→ 今月の作業時間集計\n"
             "作業報告は自動で記録・分類されます✏️"
@@ -1408,19 +1438,37 @@ def get_pending_list(group_id):
 def get_knowledge_list(group_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # このグループ専用のみ表示
     c.execute('''
         SELECT content, stored_by, created_at FROM knowledge
-        WHERE group_id=? ORDER BY created_at DESC LIMIT 20
+        WHERE group_id=? AND scope='group' ORDER BY created_at DESC LIMIT 20
     ''', (group_id,))
     rows = c.fetchall()
     conn.close()
     if not rows:
-        return "🦉 まだ何も覚えていません。\n「覚えておいて：〇〇」で教えてください！"
-    lines = [f"🦉 覚えている情報（{len(rows)}件）\n"]
+        return "🦉 このグループ専用の知識はまだありません。\n「覚えておいて：〇〇」で教えてください！\n\n共通知識は「/共通知識」で確認できます。"
+    lines = [f"🔒 このグループの知識（{len(rows)}件）\n"]
     for content, stored_by, created_at in rows:
         lines.append(f"・{content}\n  （{stored_by}、{created_at[:10]}）")
     return "\n".join(lines)
 
+
+def get_shared_knowledge_list():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    # 全グループ共通知識を表示
+    c.execute('''
+        SELECT content, stored_by, created_at FROM knowledge
+        WHERE scope='shared' ORDER BY created_at DESC LIMIT 30
+    ''')
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return "🌐 共通知識はまだありません。\n「共通で覚えておいて：〇〇」で登録できます！"
+    lines = [f"🌐 全グループ共通の知識（{len(rows)}件）\n"]
+    for content, stored_by, created_at in rows:
+        lines.append(f"・{content}\n  （{stored_by}、{created_at[:10]}）")
+    return "\n".join(lines)
 
 def get_monthly_summary(group_id):
     today = datetime.now()
