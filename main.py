@@ -172,9 +172,16 @@ def init_db():
             message_id TEXT NOT NULL,
             filename TEXT,
             media_type TEXT,
-            timestamp TEXT NOT NULL
+            timestamp TEXT NOT NULL,
+            file_content TEXT
         )
     ''')
+    # マイグレーション: file_content カラムが無い場合に追加
+    try:
+        c.execute('ALTER TABLE recent_media ADD COLUMN file_content TEXT')
+        conn.commit()
+    except Exception:
+        pass  # すでに存在する場合は無視
     conn.commit()
     conn.close()
 
@@ -182,14 +189,26 @@ def init_db():
 init_db()
 
 
-def save_recent_media(group_id, user_id, message_id, filename, media_type):
+def save_recent_media(group_id, user_id, message_id, filename, media_type, file_content=None):
     """ファイル・画像のメッセージIDをDBに保存（自動分析しない）"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     c.execute(
-        'INSERT INTO recent_media (group_id, user_id, message_id, filename, media_type, timestamp) VALUES (?,?,?,?,?,?)',
-        (group_id, user_id, message_id, filename, media_type, ts)
+        'INSERT INTO recent_media (group_id, user_id, message_id, filename, media_type, timestamp, file_content) VALUES (?,?,?,?,?,?,?)',
+        (group_id, user_id, message_id, filename, media_type, ts, file_content)
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_file_content(group_id, message_id, file_content):
+    """ファイル分析後にテキスト内容をDBに保存（Fix1: 次の会話でも参照可能に）"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        'UPDATE recent_media SET file_content=? WHERE group_id=? AND message_id=?',
+        (file_content, group_id, message_id)
     )
     conn.commit()
     conn.close()
@@ -202,17 +221,31 @@ def get_recent_media(group_id, media_type=None, minutes=60):
     cutoff = (datetime.now() - timedelta(minutes=minutes)).strftime('%Y-%m-%d %H:%M:%S')
     if media_type:
         c.execute(
-            'SELECT message_id, filename, media_type, user_id FROM recent_media WHERE group_id=? AND media_type=? AND timestamp>=? ORDER BY timestamp DESC LIMIT 1',
+            'SELECT message_id, filename, media_type, user_id, file_content FROM recent_media WHERE group_id=? AND media_type=? AND timestamp>=? ORDER BY timestamp DESC LIMIT 1',
             (group_id, media_type, cutoff)
         )
     else:
         c.execute(
-            'SELECT message_id, filename, media_type, user_id FROM recent_media WHERE group_id=? AND timestamp>=? ORDER BY timestamp DESC LIMIT 1',
+            'SELECT message_id, filename, media_type, user_id, file_content FROM recent_media WHERE group_id=? AND timestamp>=? ORDER BY timestamp DESC LIMIT 1',
             (group_id, cutoff)
         )
     row = c.fetchone()
     conn.close()
-    return row
+    return row  # (message_id, filename, media_type, user_id, file_content)
+
+
+def get_recent_file_content(group_id, minutes=1440):
+    """最近分析済みのファイルテキストを取得（デフォルト24時間以内）。次の会話でも参照できるように。"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    cutoff = (datetime.now() - timedelta(minutes=minutes)).strftime('%Y-%m-%d %H:%M:%S')
+    c.execute(
+        'SELECT filename, file_content FROM recent_media WHERE group_id=? AND media_type=? AND file_content IS NOT NULL AND timestamp>=? ORDER BY timestamp DESC LIMIT 1',
+        (group_id, 'file', cutoff)
+    )
+    row = c.fetchone()
+    conn.close()
+    return row  # (filename, file_content) or None
 
 
 # ==================== スケジューラ ====================
@@ -481,11 +514,13 @@ def handle_file(event):
 
 
 
-def analyze_image_with_sonnet(image_base64, user_name):
+def analyze_image_with_sonnet(image_base64, user_name, user_instruction=None):
     if not ANTHROPIC_API_KEY:
         return "申し訳ありません、AIサービスに接続できません。"
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        # Fix2: ユーザーの具体的な指示があれば使う
+        question = user_instruction if user_instruction else "これは何ですか？詳しく教えてください。"
         response = client.messages.create(
             model=MODEL_SMART,
             max_tokens=600,
@@ -499,13 +534,14 @@ def analyze_image_with_sonnet(image_base64, user_name):
                 "- 病害虫・雑草の場合は対処法も添える\n"
                 "- LINEなので長くても15行以内\n"
                 "- 絵文字は🦉を中心に適度に使う\n"
-                "- 判別が難しい場合は正直にその旨を伝える"
+                "- 判別が難しい場合や画像が不鮮明な場合は正直にその旨を伝える\n"
+                "- 見えていないもの・判断できないことは断言しない"
             ),
             messages=[{
                 "role": "user",
                 "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_base64}},
-                    {"type": "text", "text": f"{user_name}さんが画像を送りました。これは何ですか？詳しく教えてください。"}
+                    {"type": "text", "text": f"{user_name}さんの質問: {question}"}
                 ]
             }]
         )
@@ -673,32 +709,63 @@ def handle_mention(event, message_text, user_name, group_id):
     if is_file_req:
         recent = get_recent_media(group_id, 'file')
         if recent:
-            message_id, filename, _, _ = recent
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=f'「{filename}」を読み込みますね🦉…')
-            )
-            try:
-                message_content = line_bot_api.get_message_content(message_id)
-                file_bytes = b''.join(chunk for chunk in message_content.iter_content())
-            except Exception as e:
-                line_bot_api.push_message(group_id, TextSendMessage(text=f'ファイルの取得に失敗しました🦉（{e}）'))
-                return
-            file_text = extract_file_text(file_bytes, filename)
-            if not file_text.strip():
-                line_bot_api.push_message(group_id, TextSendMessage(text=f'「{filename}」からテキストを読み取れませんでした🦉'))
-                return
+            message_id, filename, _, _, saved_content = recent
+            # すでにDB保存済みのテキストがあればそれを使う（再ダウンロード不要）
+            if saved_content:
+                file_text = saved_content
+                print(f"[FILE] using cached content for {filename}", flush=True)
+                # キャッシュ使用時は reply_token を使って「考えますね」と返す
+                try:
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(text=f'「{filename}」の内容を確認しますね🦉…')
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(text=f'「{filename}」を読み込みますね🦉…')
+                    )
+                except Exception:
+                    pass
+                try:
+                    message_content = line_bot_api.get_message_content(message_id)
+                    file_bytes = b''.join(chunk for chunk in message_content.iter_content())
+                except Exception as e:
+                    line_bot_api.push_message(group_id, TextSendMessage(text=f'ファイルの取得に失敗しました🦉（{e}）'))
+                    return
+                file_text = extract_file_text(file_bytes, filename)
+                if not file_text.strip():
+                    line_bot_api.push_message(group_id, TextSendMessage(text=f'「{filename}」からテキストを読み取れませんでした🦉'))
+                    return
+                # Fix1: 抽出したテキストをDBに保存（次の会話でも参照できるように）
+                update_file_content(group_id, message_id, file_text[:8000])
+
             MAX_CHARS = 8000
             truncated_note = ''
             if len(file_text) > MAX_CHARS:
                 file_text = file_text[:MAX_CHARS]
                 truncated_note = f'\n\n※長いため最初の{MAX_CHARS}文字のみ読み込みました。'
-            prompt = f'{user_name}さんが「{filename}」というファイルを共有しました。内容を確認して要点をまとめてください。\n\n--- ファイル内容 ---\n{file_text}\n--- 以上 ---'
+
+            # Fix2: ユーザーの実際の指示をプロンプトに使う（固定の「要約」から脱却）
+            user_instruction = query
+            for kw in FILE_KEYWORDS:
+                user_instruction = user_instruction.replace(kw, '')
+            user_instruction = user_instruction.strip().rstrip('。、！？!?,').strip()
+            if not user_instruction:
+                user_instruction = '内容を確認して要点をまとめてください'
+
+            prompt = f'【ファイル「{filename}」の内容】\n{file_text}\n\n【{user_name}さんの指示】\n{user_instruction}'
             context  = get_group_context(group_id)
             history  = search_history(filename, group_id)
             knowledge = get_knowledge_context(group_id)
             reply = ask_sonnet(prompt, user_name, context, history, knowledge)
-            line_bot_api.push_message(group_id, TextSendMessage(text=reply + truncated_note))
+            try:
+                line_bot_api.push_message(group_id, TextSendMessage(text=reply + truncated_note))
+            except Exception as e:
+                print(f"[PUSH ERROR] {e}", flush=True)
             return
         else:
             line_bot_api.reply_message(
@@ -710,7 +777,7 @@ def handle_mention(event, message_text, user_name, group_id):
     if is_image_req:
         recent = get_recent_media(group_id, 'image')
         if recent:
-            message_id, filename, _, _ = recent
+            message_id, filename, _, _, _ = recent
             line_bot_api.reply_message(
                 event.reply_token,
                 TextSendMessage(text='画像を確認しますね🦉…')
@@ -722,8 +789,16 @@ def handle_mention(event, message_text, user_name, group_id):
             except Exception as e:
                 line_bot_api.push_message(group_id, TextSendMessage(text=f'画像の取得に失敗しました🦉（{e}）'))
                 return
-            reply = analyze_image_with_sonnet(image_base64, user_name)
-            line_bot_api.push_message(group_id, TextSendMessage(text=reply))
+            # Fix2: ユーザーの具体的な質問を画像分析に渡す
+            user_instruction = query
+            for kw in IMAGE_KEYWORDS:
+                user_instruction = user_instruction.replace(kw, '')
+            user_instruction = user_instruction.strip().rstrip('。、！？!?,').strip()
+            reply = analyze_image_with_sonnet(image_base64, user_name, user_instruction or None)
+            try:
+                line_bot_api.push_message(group_id, TextSendMessage(text=reply))
+            except Exception as e:
+                print(f"[PUSH ERROR] {e}", flush=True)
             return
         else:
             line_bot_api.reply_message(
@@ -733,11 +808,18 @@ def handle_mention(event, message_text, user_name, group_id):
             return
 
     # 通常のテキスト質問
+    # Fix1: 最近分析したファイル内容があれば文脈に含める（ファイルについての追加質問に対応）
+    file_context = ""
+    recent_file = get_recent_file_content(group_id, minutes=1440)
+    if recent_file:
+        fname, fcontent = recent_file
+        file_context = f"\n\n【直近で分析したファイル「{fname}」の内容（抜粋）】\n{fcontent[:2000]}"
+
     line_bot_api.reply_message(
         event.reply_token,
         TextSendMessage(text="少し考えますね🦉…")
     )
-    context  = get_group_context(group_id)
+    context  = get_group_context(group_id) + file_context
     history  = search_history(query, group_id)
     knowledge = get_knowledge_context(group_id)
     reply = ask_sonnet(query, user_name, context, history, knowledge)
@@ -898,9 +980,16 @@ def ask_sonnet(query, user_name, db_context, history="", knowledge=""):
 - LINEのメッセージなので短く端的に（長くても15行以内）
 - 過去のやり取りを聞かれた場合は、上記の履歴から該当する内容を探して答える
 - 「誰が言った」「いつ決まった」など事実確認は履歴から正確に答える
-- わからない・記録がない場合は正直に伝える
+- わからない・記録がない場合は正直に「記録が見つかりません」と伝える
 - 絵文字は🦉を中心に適度に使って親しみやすく
-- 回答の最後に追加で確認できることがあれば一言添える"""
+- 回答の最後に追加で確認できることがあれば一言添える
+
+【ハリュシネーション防止ルール（最重要）】
+- 自分が実際に処理・分析したファイルや画像のみ「見た」「読んだ」と言う
+- 処理していないコンテンツについては「確認できていません」「ファイルを送って @オルオル 読んで と言ってください」と正直に伝える
+- 不確かな情報は「〜かもしれません」「確認が必要です」と明示する
+- 記録や履歴にない事実について断言しない（「〜だったと思います」ではなく「記録にはありません」）
+- 「はい、見えています」「はい、読みました」などの嘘の確認をしない"""
 
         response = client.messages.create(
             model=MODEL_SMART,
