@@ -1337,6 +1337,8 @@ def handle_command(event, text, group_id):
         reply = get_pending_list(group_id)
     elif cmd in ['/知識', '/knowledge']:
     elif cmd in ['/共通知識', '/shared']:
+    elif cmd in ['/グループid', '/groupid', '/group_id']:
+        reply = f"🦉 このグループのID\n\n{group_id}\n\nRailwayの環境変数 ADMIN_GROUP_ID にこの値を設定すると、このグループが管理グループになります。"
         reply = get_shared_knowledge_list()
         reply = get_knowledge_list(group_id)
     elif cmd in ['/週報', '/weekly']:
