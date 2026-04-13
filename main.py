@@ -467,49 +467,34 @@ def handle_file_raw(ev):
 
 @handler.add(MessageEvent, message=FileMessage)
 def handle_file(event):
+    """ファイルをDBに静かに保存するだけ。返信しない。
+    @オルオルで依頼されたときだけ分析・返答する。"""
     if event.source.type != 'group':
         return
     group_id  = event.source.group_id
     user_id   = event.source.user_id
-    user_name = get_user_name(group_id, user_id)
     filename  = event.message.file_name
+    message_id = event.message.id
 
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=f'「{filename}」を確認しますね🦉…')
-    )
+    # まずDBにメタ情報を保存（reply_tokenを消費しないよう返信しない）
+    save_recent_media(group_id, user_id, message_id, filename, 'file')
+    print(f"[FILE] received: group={group_id} file={filename}", flush=True)
 
+    # LINEのファイルダウンロードトークンは期限があるので、
+    # 今のうちにテキスト抽出してDBに保存しておく
     try:
-        message_content = line_bot_api.get_message_content(event.message.id)
+        message_content = line_bot_api.get_message_content(message_id)
         file_bytes = b''.join(chunk for chunk in message_content.iter_content())
+        file_text = extract_file_text(file_bytes, filename)
+        if file_text.strip():
+            MAX_CHARS = 8000
+            if len(file_text) > MAX_CHARS:
+                file_text = file_text[:MAX_CHARS]
+            update_file_content(group_id, message_id, file_text)
+            print(f"[FILE] text saved to DB: {filename} ({len(file_text)} chars)", flush=True)
     except Exception as e:
-        print(f"File download error: {e}")
-        line_bot_api.push_message(group_id, TextSendMessage(text='ファイルの取得に失敗しました🦉 もう一度送ってみてください。'))
-        return
-
-    file_text = extract_file_text(file_bytes, filename)
-    if not file_text.strip():
-        line_bot_api.push_message(group_id, TextSendMessage(text=f'「{filename}」からテキストを読み取れませんでした🦉'))
-        return
-
-    MAX_CHARS = 8000
-    truncated_note = ''
-    if len(file_text) > MAX_CHARS:
-        file_text = file_text[:MAX_CHARS]
-        truncated_note = f'\n\n※ファイルが長いため最初の{MAX_CHARS}文字のみ読み込みました。'
-
-    prompt = f"""{user_name}さんが「{filename}」というファイルを共有しました。
-内容を確認して要点をまとめてください。
-
---- ファイル内容 ---
-{file_text}
---- 以上 ---"""
-
-    context  = get_group_context(group_id)
-    history  = search_history(filename, group_id)
-    knowledge = get_knowledge_context(group_id)
-    reply = ask_sonnet(prompt, user_name, context, history, knowledge)
-    line_bot_api.push_message(group_id, TextSendMessage(text=reply + truncated_note))
+        print(f"[FILE] download/extract error (silent): {e}", flush=True)
+    # 返信しない — スタッフ間のファイル共有を邪魔しない
 
 
 
