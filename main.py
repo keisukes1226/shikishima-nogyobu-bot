@@ -604,6 +604,10 @@ def handle_message(event):
         )
         return
 
+    # 管理グループでは自動解析しない（私的会話への誤反応防止）
+    if ADMIN_GROUP_ID and group_id == ADMIN_GROUP_ID:
+        return
+
     # ⑤ 通常メッセージ解析（Haiku）
     analysis = analyze_message_full(message_text, user_name)
     mark_replied_context(group_id, user_id, message_text)
