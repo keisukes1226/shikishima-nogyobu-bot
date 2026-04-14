@@ -724,24 +724,23 @@ def get_thinking_message(query):
     """クエリの内容に応じた自然な「考え中」メッセージを返す"""
     import random
     q = query
-    if any(kw in q for kw in ['タスク', 'やること', 'TODO', 'todo', '未完了', 'やってない', 'やり残し']):
+    # ※「いつ」単体は「いつもお世話に…」等に誤マッチするので使わない
+    if any(kw in q for kw in ['タスク', 'やること', 'TODO', 'todo', '未完了', 'やり残し']):
         return random.choice(['タスクを確認しますね🦉', 'ToDoリスト、見てみますね🦉'])
-    elif any(kw in q for kw in ['スケジュール', '予定', 'カレンダー', 'いつ', '何時', '何日']):
+    elif any(kw in q for kw in ['スケジュール', 'カレンダー', '何時', '何日', 'いつから', 'いつまで', 'いつ？', 'いつですか']):
         return random.choice(['スケジュールを調べますね🦉', '予定を確認しますね🦉'])
     elif any(kw in q for kw in ['決定', '決まった', 'ルール', '方針', '決めた']):
         return '決定事項を確認しますね🦉'
-    elif any(kw in q for kw in ['未決', '保留', '宿題', 'ペンディング', 'スルー', '忘れ']):
+    elif any(kw in q for kw in ['未決', '保留', '宿題', 'ペンディング', 'スルー']):
         return random.choice(['保留案件を調べますね🦉', 'スルーがないか確認しますね🦉'])
-    elif any(kw in q for kw in ['書いて', '作って', '考えて', '提案', '案を', '文章', 'メール', '返信']):
+    elif any(kw in q for kw in ['書いて', '作って', '考えて', '提案して', '文章', 'メールを', '返信を']):
         return random.choice(['考えてみますね🦉', 'ちょっと考えてみます🦉'])
-    elif any(kw in q for kw in ['まとめ', '整理', '要点', 'サマリー', 'ポイント']):
+    elif any(kw in q for kw in ['まとめ', '整理', '要点', 'サマリー']):
         return 'まとめてみますね🦉'
-    elif any(kw in q for kw in ['先週', '先月', '過去', '前に', 'この間', 'この前', 'いつだっけ']):
+    elif any(kw in q for kw in ['先週', '先月', 'この間', 'この前', 'いつだっけ']):
         return '過去のやり取りを確認しますね🦉'
-    elif any(kw in q for kw in ['誰', 'だれ', '誰が', '誰に', '何を', '何が', 'どこ', 'なぜ', 'なんで']):
-        return random.choice(['調べますね🦉', 'ちょっと確認しますね🦉'])
-    elif '?' in q or '？' in q:
-        return random.choice(['うーん🦉', 'ちょっと待って🦉', '確認しますね🦉'])
+    elif any(kw in q for kw in ['対応', 'どうすれば', 'どう対応', 'どうしたら', 'アドバイス']):
+        return random.choice(['ちょっと考えてみますね🦉', '確認してみます🦉'])
     else:
         return random.choice(['少し考えますね🦉', 'ちょっと待ってね🦉', 'うーん🦉'])
 
