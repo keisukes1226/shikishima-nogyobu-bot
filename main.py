@@ -1376,6 +1376,23 @@ def handle_command(event, text, group_id):
         conn.commit()
         conn.close()
         reply = 'このグループへの朝・週次レポートを再開します🦉'
+    elif text.startswith('/作業記録'):
+        work_text = text[len('/作業記録'):].strip()
+        user_id = getattr(event.source, 'user_id', None)
+        user_name = get_user_name(group_id, user_id) if user_id else '不明'
+        if not work_text:
+            reply = (
+                "📝 作業内容を入力してください。\n"
+                "例：/作業記録 草刈り 2時間\n"
+                "例：/作業記録 田植え（時間は後で聞きます）"
+            )
+        else:
+            analysis = analyze_message_full(work_text, user_name)
+            if not analysis.get('work_category'):
+                reply = "⚠️ 作業の種類が読み取れませんでした。\n例：草刈り、田植え、農薬散布など作業名を入れてください。"
+            else:
+                process_work_report(event, analysis, work_text, user_name, group_id, user_id)
+                return
     elif cmd in ['/ヘルプ', '/help']:
         reply = (
             "【コマンド一覧】\n"
@@ -1391,9 +1408,10 @@ def handle_command(event, text, group_id):
             "【知識の記憶】\n"
             "「覚えておいて：○○」→ このグループ専用🔒\n"
             "「共通で覚えておいて：○○」→ 全グループ共通🌐\n\n"
-            "【営農グループ限定】\n"
-            "「/集計」→ 今月の作業時間集計\n"
-            "作業報告は自動で記録・分類されます✏️"
+            "【作業記録】\n"
+            "「/作業記録 草刈り 2時間」→ 作業を記録📝\n\n"
+            "【集計】\n"
+            "「/集計」→ 今月の作業時間集計"
         )
     else:
         return
