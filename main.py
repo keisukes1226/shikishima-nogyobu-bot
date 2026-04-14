@@ -40,6 +40,8 @@ _data_dir = '/data' if os.path.isdir('/data') else '/tmp'  # Railway永続ボリ
 DB_PATH = os.environ.get('DB_PATH', os.path.join(_data_dir, 'messages.db'))
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '')
 GOOGLE_CALENDAR_ID = os.environ.get('GOOGLE_CALENDAR_ID', 'primary')
+ADMIN_GROUP_ID = os.environ.get('ADMIN_GROUP_ID', '')
+LINE_PHOTO_FOLDER_ID = os.environ.get('LINE_PHOTO_FOLDER_ID', '')
 
 MODEL_FAST  = "claude-haiku-4-5-20251001"
 MODEL_SMART = "claude-sonnet-4-20250514"
@@ -404,6 +406,19 @@ def handle_image(event):
     # 画像IDを保存するだけ（自動分析しない）
     # 「@オルオル この画像見て」と言われた時に分析する
     save_recent_media(group_id, user_id, event.message.id, '画像', 'image')
+
+    # 管理グループからの写真はDriveに自動保存
+    if ADMIN_GROUP_ID and group_id == ADMIN_GROUP_ID and LINE_PHOTO_FOLDER_ID:
+        try:
+            user_name = get_user_name(group_id, user_id)
+            url = save_photo_to_drive(event.message.id, user_name)
+            if url:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text=f"📷 写真をDriveに保存しました\n{url}")
+                )
+        except Exception as e:
+            print(f"Photo save error: {e}")
 
 
 # ==================== ファイル対応（txt/pdf/docx/xlsx/csv） ====================
@@ -1729,6 +1744,47 @@ def get_calendar_service():
         return build('calendar', 'v3', credentials=creds)
     except Exception as e:
         print(f"Calendar service error: {e}")
+        return None
+
+
+def get_drive_service():
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        return None
+    try:
+        creds = service_account.Credentials.from_service_account_info(
+            json.loads(GOOGLE_SERVICE_ACCOUNT_JSON),
+            scopes=['https://www.googleapis.com/auth/drive']
+        )
+        return build('drive', 'v3', credentials=creds)
+    except Exception as e:
+        print(f"Drive service error: {e}")
+        return None
+
+
+def save_photo_to_drive(message_id, user_name):
+    """LINE画像をGoogle Driveフォルダに保存してURLを返す"""
+    if not LINE_PHOTO_FOLDER_ID:
+        return None
+    drive = get_drive_service()
+    if not drive:
+        return None
+    try:
+        from googleapiclient.http import MediaIoBaseUpload
+        import io
+        message_content = line_bot_api.get_message_content(message_id)
+        image_bytes = b''.join(chunk for chunk in message_content.iter_content())
+
+        now_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"{now_str}_{user_name}.jpg"
+
+        media = MediaIoBaseUpload(io.BytesIO(image_bytes), mimetype='image/jpeg')
+        file_meta = {'name': filename, 'parents': [LINE_PHOTO_FOLDER_ID]}
+        result = drive.files().create(
+            body=file_meta, media_body=media, fields='id,webViewLink'
+        ).execute()
+        return result.get('webViewLink')
+    except Exception as e:
+        print(f"Drive upload error: {e}")
         return None
 
 
