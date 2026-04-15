@@ -361,12 +361,11 @@ def get_bot_user_id():
 
 
 def is_bot_mentioned(event):
-    # 自然な「オルオル」呼びかけを検知（@メンション不要）
+    """ボットへの直接呼びかけのみ検知（「おるおる以外〜」等への誤反応を防ぐ）"""
     BOT_NAMES = ['オルオル', 'おるおる']
     text = getattr(event.message, 'text', '') or ''
-    if any(name in text for name in BOT_NAMES):
-        return True
-    # 公式@メンションも検知
+
+    # ① 公式LINEの@メンションがボット本人を指している場合
     try:
         msg = event.message
         if hasattr(msg, 'mention') and msg.mention:
@@ -377,6 +376,18 @@ def is_bot_mentioned(event):
                         return True
     except Exception as e:
         print(f"mention check error: {e}")
+
+    # ② 文中に「@オルオル」「@おるおる」がある場合
+    for name in BOT_NAMES:
+        if f'@{name}' in text:
+            return True
+
+    # ③ 文頭に「オルオル」「おるおる」＋呼びかけ記号（読点・感嘆符等）がある場合
+    # 「おるおる以外〜」「おるおるって何？」等は除外
+    ADDRESS_PATTERN = r'^@?(?:オルオル|おるおる)[、。！？!?,\s\u3000]'
+    if re.match(ADDRESS_PATTERN, text):
+        return True
+
     return False
 
 def extract_mention_text(text):
