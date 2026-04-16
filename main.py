@@ -145,6 +145,20 @@ def init_db():
         )
     ''')
     c.execute('''
+        CREATE TABLE IF NOT EXISTS action_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT NOT NULL,
+            requester_name TEXT,
+            assignee_name TEXT NOT NULL,
+            task_content TEXT NOT NULL,
+            deadline TEXT,
+            created_at TEXT NOT NULL,
+            resolved INTEGER DEFAULT 0,
+            resolved_at TEXT,
+            last_followup_at TEXT
+        )
+    ''')
+    c.execute('''
         CREATE TABLE IF NOT EXISTS pending_issues (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             group_id TEXT NOT NULL,
@@ -282,6 +296,7 @@ def daily_check():
     for gid in groups:
         notify_unanswered(gid)
         followup_pending_issues(gid)
+        followup_action_items(gid)
 
 
 def weekly_report_job():
@@ -295,6 +310,126 @@ def weekly_report_job():
         report = build_weekly_report(gid)
         if report:
             line_bot_api.push_message(gid, TextSendMessage(text=report))
+
+
+def extract_action_items(message_text, user_name, group_id):
+    """Haikuでメッセージから依頼・タスクを抽出してDBに保存"""
+    if not ANTHROPIC_API_KEY:
+        return
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        today = datetime.now().strftime('%Y-%m-%d')
+        prompt = (
+            f"今日: {today}\n"
+            f"発言者: {user_name}\n"
+            f"メッセージ:「{message_text}」\n\n"
+            f"このメッセージに「誰かへの依頼・お願い・確認依頼・タスク指示」が含まれているか判定してください。\n"
+            f'以下のJSONのみを返してください（説明不要）:\n'
+            f'{{\n'
+            f'  "has_action": true/false,\n'
+            f'  "items": [\n'
+            f'    {{\n'
+            f'      "assignee": "担当者名（わからなければnull）",\n'
+            f'      "task": "依頼内容（簡潔に20文字以内）",\n'
+            f'      "deadline": "YYYY-MM-DD または null"\n'
+            f'    }}\n'
+            f'  ]\n'
+            f'}}\n\n'
+            f'判定基準:\n'
+            f'- 「〜お願いします」「〜確認してください」「〜してほしい」「〜よろしく」→ has_action: true\n'
+            f'- 雑談・報告・独り言・挨拶 → has_action: false\n'
+            f'- 担当者名は発言内の人名のみ。不明なら null'
+        )
+        result = client.messages.create(
+            model=MODEL_FAST, max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        t = result.content[0].text.strip()
+        start = t.find('{')
+        end = t.rfind('}') + 1
+        data = json.loads(t[start:end])
+        if not data.get('has_action'):
+            return
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        for item in data.get('items', []):
+            assignee = item.get('assignee') or '不明'
+            task = item.get('task', '')
+            deadline = item.get('deadline')
+            if task:
+                c.execute(
+                    'INSERT INTO action_items (group_id, requester_name, assignee_name, task_content, deadline, created_at) VALUES (?,?,?,?,?,?)',
+                    (group_id, user_name, assignee, task, deadline, now)
+                )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"extract_action_items error: {e}")
+
+
+def resolve_action_items(message_text, user_name, group_id):
+    """「了解」「完了」等の返答で未解決アクションアイテムをクローズ"""
+    RESOLVE_KEYWORDS = ['了解', '了承', 'わかりました', 'わかった', '確認しました', '確認した',
+                        'やりました', '完了', '対応しました', '対応した', 'done', 'Done', '✅', '👍']
+    if not any(kw in message_text for kw in RESOLVE_KEYWORDS):
+        return
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        UPDATE action_items SET resolved=1, resolved_at=?
+        WHERE group_id=? AND assignee_name=? AND resolved=0
+        AND id IN (
+            SELECT id FROM action_items
+            WHERE group_id=? AND assignee_name=? AND resolved=0
+            ORDER BY created_at DESC LIMIT 3
+        )
+    ''', (now, group_id, user_name, group_id, user_name))
+    conn.commit()
+    conn.close()
+
+
+def followup_action_items(group_id):
+    """24時間以上未解決のアクションアイテムを人別にまとめてフォローアップ"""
+    cutoff = (datetime.now() - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        SELECT id, assignee_name, task_content, requester_name, deadline
+        FROM action_items
+        WHERE group_id=? AND resolved=0
+          AND created_at<=?
+          AND (last_followup_at IS NULL OR last_followup_at<=?)
+        ORDER BY assignee_name, created_at
+    ''', (group_id, cutoff, cutoff))
+    rows = c.fetchall()
+    if not rows:
+        conn.close()
+        return
+    from collections import defaultdict
+    by_assignee = defaultdict(list)
+    ids = []
+    for id_, assignee, task, requester, deadline in rows:
+        by_assignee[assignee].append((task, requester, deadline))
+        ids.append(id_)
+    lines = ["🦉 フォローアップのお時間です。以下の件、その後いかがでしょうか？\n"]
+    for assignee, items in by_assignee.items():
+        lines.append(f"【{assignee}さん】")
+        for task, requester, deadline in items:
+            dl = f"（期限：{deadline}）" if deadline else ""
+            req = f"（{requester}さんより）" if requester and requester != '不明' else ""
+            lines.append(f"  ・{task}{dl}{req}")
+    msg = "\n".join(lines)
+    try:
+        line_bot_api.push_message(group_id, TextSendMessage(text=msg))
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        for id_ in ids:
+            c.execute('UPDATE action_items SET last_followup_at=? WHERE id=?', (now, id_))
+        conn.commit()
+    except Exception as e:
+        print(f"followup_action_items error: {e}")
+    conn.close()
 
 
 def send_reminders():
@@ -670,6 +805,15 @@ def handle_message(event):
 
     # 全メッセージを保存
     save_all_message(timestamp, group_id, user_id, user_name, message_text, message_id)
+
+    # 【秘書機能】全グループ・全メッセージを俯瞰監視
+    import threading
+    threading.Thread(
+        target=extract_action_items,
+        args=(message_text, user_name, group_id),
+        daemon=True
+    ).start()
+    resolve_action_items(message_text, user_name, group_id)
 
     # ① コマンド
     if message_text.startswith('/'):
