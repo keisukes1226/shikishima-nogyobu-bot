@@ -591,22 +591,7 @@ def handle_message(event):
         handle_command(event, message_text, group_id)
         return
 
-    # ② @メンション
-    if is_bot_mentioned(event):
-        handle_mention(event, message_text, user_name, group_id)
-        return
-
-    # ③ 「覚えておいて」系キーワード検知（文脈で判断）
-    if any(kw in message_text for kw in KNOWLEDGE_KEYWORDS):
-        # キーワードを除いて内容があれば記録（「覚えておいて！」だけは無視）
-        stripped = message_text
-        for kw in KNOWLEDGE_KEYWORDS:
-            stripped = stripped.replace(kw, '').replace('：', '').replace(':', '')
-        if stripped.strip().rstrip('！!。、？?').strip():
-            handle_knowledge_store(event, message_text, user_name, group_id)
-            return
-
-    # ④ 会話ステート
+    # ② 会話ステート（@メンションより優先：返答に@をつけても文脈を維持）
     pending = get_pending_state(group_id, user_id)
     if pending:
         handle_conversation_response(
@@ -614,6 +599,20 @@ def handle_message(event):
             group_id, user_id, timestamp, message_id
         )
         return
+
+    # ③ @メンション
+    if is_bot_mentioned(event):
+        handle_mention(event, message_text, user_name, group_id)
+        return
+
+    # ④ 「覚えておいて」系キーワード検知（文脈で判断）
+    if any(kw in message_text for kw in KNOWLEDGE_KEYWORDS):
+        stripped = message_text
+        for kw in KNOWLEDGE_KEYWORDS:
+            stripped = stripped.replace(kw, '').replace('：', '').replace(':', '')
+        if stripped.strip().rstrip('！!。、？?').strip():
+            handle_knowledge_store(event, message_text, user_name, group_id)
+            return
 
     # 管理グループでは自動解析しない（私的会話への誤反応防止）
     if ADMIN_GROUP_ID and group_id == ADMIN_GROUP_ID:
