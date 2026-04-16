@@ -60,6 +60,7 @@ WEEKDAY_JP = ['月', '火', '水', '木', '金', '土', '日']
 STATE_ASKING_HOURS  = 'asking_hours'
 STATE_ASKING_PEOPLE = 'asking_people'
 STATE_CONFIRMING    = 'confirming'
+STATE_ASKING_REMIND_TIME = 'asking_remind_time'
 
 CORRECTION_KEYWORDS = [
     '修正', '違う', 'ちがう', '間違', 'いや', 'そうじゃない',
@@ -185,6 +186,18 @@ def init_db():
             file_content TEXT
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            user_name TEXT,
+            content TEXT NOT NULL,
+            remind_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            sent INTEGER DEFAULT 0
+        )
+    ''')
     # マイグレーション: file_content カラムが無い場合に追加
     try:
         c.execute('ALTER TABLE recent_media ADD COLUMN file_content TEXT')
@@ -284,9 +297,81 @@ def weekly_report_job():
             line_bot_api.push_message(gid, TextSendMessage(text=report))
 
 
+def send_reminders():
+    """毎分：期限になったリマインダーを送信"""
+    now = datetime.now().strftime('%Y-%m-%d %H:%M')
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        'SELECT id, group_id, user_name, content FROM reminders WHERE sent=0 AND remind_at<=?',
+        (now,)
+    )
+    rows = c.fetchall()
+    for id_, group_id, user_name, content in rows:
+        text = f"⏰ リマインドです🦉\n{user_name}さん、{content}"
+        try:
+            line_bot_api.push_message(group_id, TextSendMessage(text=text))
+            c.execute('UPDATE reminders SET sent=1 WHERE id=?', (id_,))
+        except Exception as e:
+            print(f"Reminder send error: {e}")
+    conn.commit()
+    conn.close()
+
+
+def save_reminder(group_id, user_id, user_name, content, remind_at):
+    """リマインダーをDBに保存"""
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        'INSERT INTO reminders (group_id, user_id, user_name, content, remind_at, created_at) VALUES (?,?,?,?,?,?)',
+        (group_id, user_id, user_name, content, remind_at, now)
+    )
+    conn.commit()
+    conn.close()
+
+
+def parse_reminder_request(query, user_name):
+    """Haikuでリマインド要求を解析、JSON返却"""
+    if not ANTHROPIC_API_KEY:
+        return None
+    today = datetime.now().strftime('%Y-%m-%d %H:%M')
+    prompt = (
+        f"今日の日時: {today}\n"
+        f"ユーザー「{user_name}」のメッセージ:「{query}」\n\n"
+        f"これがリマインド依頼かを判定し、以下のJSONのみを返してください（説明不要）:\n"
+        f'{{\n'
+        f'  "is_reminder": true/false,\n'
+        f'  "content": "リマインドする内容（簡潔に）",\n'
+        f'  "remind_at": "YYYY-MM-DD HH:MM または null",\n'
+        f'  "needs_time": true/false\n'
+        f'}}\n\n'
+        f'時刻のルール:\n'
+        f'- 「明日まで」→ 明日の09:00\n'
+        f'- 「明日の朝」→ 明日の08:00\n'
+        f'- 「今夜」→ 今日の20:00\n'
+        f'- 「お任せ」「適当に」→ 明日の09:00（needs_time: false）\n'
+        f'- 時刻が全く不明 → needs_time: true, remind_at: null'
+    )
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        result = client.messages.create(
+            model=MODEL_FAST, max_tokens=200,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = result.content[0].text.strip()
+        start = text.find('{')
+        end = text.rfind('}') + 1
+        return json.loads(text[start:end])
+    except Exception as e:
+        print(f"parse_reminder_request error: {e}")
+        return None
+
+
 scheduler = BackgroundScheduler(timezone='Asia/Tokyo')
 scheduler.add_job(daily_check, 'cron', hour=9, minute=0)
 scheduler.add_job(weekly_report_job, 'cron', day_of_week='mon', hour=9, minute=0)
+scheduler.add_job(send_reminders, 'interval', minutes=1)
 scheduler.start()
 
 
@@ -850,6 +935,26 @@ def handle_mention(event, message_text, user_name, group_id):
             )
             return
 
+    # リマインド依頼の検知
+    REMIND_KEYWORDS = ['リマインド', '通知して', '忘れたら', '思い出させ', 'リマインダー', '教えてほしい']
+    if any(kw in query for kw in REMIND_KEYWORDS):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text='少しお待ちください🦉'))
+        info = parse_reminder_request(query, user_name)
+        if info and info.get('is_reminder'):
+            if info.get('needs_time'):
+                save_pending_state(group_id, user_id, STATE_ASKING_REMIND_TIME,
+                                   {'content': info['content']}, query)
+                line_bot_api.push_message(group_id, TextSendMessage(
+                    text=f"承知しました🦉\n「{info['content']}」についてリマインドしますね。\n何時頃にお知らせすればよいですか？\n（例：明日の9時、今夜8時）"
+                ))
+            else:
+                save_reminder(group_id, user_id, user_name, info['content'], info['remind_at'])
+                remind_dt = datetime.strptime(info['remind_at'], '%Y-%m-%d %H:%M')
+                line_bot_api.push_message(group_id, TextSendMessage(
+                    text=f"⏰ リマインドを設定しました🦉\n内容：{info['content']}\n日時：{remind_dt.strftime('%m月%d日 %H:%M')}"
+                ))
+            return
+
     # 通常のテキスト質問
     # Fix1: 最近分析したファイル内容があれば文脈に含める（ファイルについての追加質問に対応）
     file_context = ""
@@ -1100,6 +1205,22 @@ def handle_conversation_response(
         mark_replied_context(group_id, user_id, message_text)
         if analysis.get('work_category'):
             process_work_report(event, analysis, message_text, user_name, group_id, user_id)
+        return
+
+    if state == STATE_ASKING_REMIND_TIME:
+        content = partial.get('content', '件の事項')
+        info = parse_reminder_request(f"{content}、{message_text}にリマインドして", user_name)
+        if info and info.get('remind_at') and not info.get('needs_time'):
+            save_reminder(group_id, user_id, user_name, content, info['remind_at'])
+            clear_pending_state(group_id, user_id)
+            remind_dt = datetime.strptime(info['remind_at'], '%Y-%m-%d %H:%M')
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text=f"⏰ リマインドを設定しました🦉\n内容：{content}\n日時：{remind_dt.strftime('%m月%d日 %H:%M')}"
+            ))
+        else:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="時間が読み取れませんでした🙏\n「明日の9時」「今夜8時」のように教えてください。"
+            ))
         return
 
     if state == STATE_ASKING_HOURS:
