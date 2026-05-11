@@ -38,30 +38,14 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 DB_PATH = os.environ.get('DB_PATH', 'messages.db')
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '')
-GOOGLE_CALENDAR_ID = os.environ.get('GOOGLE_CALENDAR_ID', 'primary')
+GOOGLE_SPREADSHEET_ID = os.environ.get('GOOGLE_SPREADSHEET_ID', '')
 
 MODEL_FAST  = "claude-3-haiku-20240307"
 MODEL_SMART = "claude-3-5-sonnet-20241022"
 
-WORK_CATEGORIES = [
-    "水稲", "大豆", "野菜", "農機・施設管理", "除草・畔草刈",
-    "水管理・用水路", "環境整備", "共同作業一般", "組合業務", "研修・視察",
-    "くるみ（脱穀）", "くるみ（選別）", "くるみ（その他）",
-    "野菜（個人）", "米（個人）", "くるみ（個人）", "その他個人"
-]
-
 UNANSWERED_THRESHOLD_HOURS = 24
 PENDING_FOLLOWUP_DAYS = 3
 WEEKDAY_JP = ['月', '火', '水', '木', '金', '土', '日']
-
-STATE_ASKING_HOURS  = 'asking_hours'
-STATE_ASKING_PEOPLE = 'asking_people'
-STATE_CONFIRMING    = 'confirming'
-
-CORRECTION_KEYWORDS = [
-    '修正', '違う', 'ちがう', '間違', 'いや', 'そうじゃない',
-    '取り消し', '削除', '消して', '直して', '変えて', 'ちょっと待って'
-]
 
 KNOWLEDGE_KEYWORDS = ['覚えておいて', '覚えて', '記録しておいて', 'メモしておいて']
 
@@ -101,19 +85,6 @@ def init_db():
     c.execute('''
         CREATE TABLE IF NOT EXISTS groups (
             group_id TEXT PRIMARY KEY, group_name TEXT, joined_at TEXT
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS conversations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            group_id TEXT NOT NULL,
-            user_id TEXT NOT NULL,
-            state TEXT NOT NULL,
-            partial_analysis TEXT,
-            original_message TEXT,
-            last_event_id TEXT,
-            created_at TEXT,
-            updated_at TEXT
         )
     ''')
     c.execute('''
@@ -286,6 +257,20 @@ def extract_mention_text(text):
     return re.sub(r'@\S+\s*', '', text).strip()
 
 
+def get_group_name(group_id):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT group_name FROM groups WHERE group_id=?', (group_id,))
+        row = c.fetchone()
+        conn.close()
+        if row and row[0]:
+            return row[0]
+    except Exception:
+        pass
+    return group_id
+
+
 def get_user_name(group_id, user_id):
     try:
         profile = line_bot_api.get_group_member_profile(group_id, user_id)
@@ -367,7 +352,9 @@ def handle_message(event):
     user_name    = get_user_name(group_id, user_id)
 
     # 全メッセージを保存
+    group_name = get_group_name(group_id)
     save_all_message(timestamp, group_id, user_id, user_name, message_text, message_id)
+    append_to_sheet(timestamp, group_name, user_name, message_text)
 
     # ① コマンド
     if message_text.startswith('/'):
@@ -384,28 +371,14 @@ def handle_message(event):
         handle_knowledge_store(event, message_text, user_name, group_id)
         return
 
-    # ④ 会話ステート
-    pending = get_pending_state(group_id, user_id)
-    if pending:
-        handle_conversation_response(
-            event, pending, message_text, user_name,
-            group_id, user_id, timestamp, message_id
-        )
-        return
-
-    # ⑤ 通常メッセージ解析（Haiku）
+    # ④ 通常メッセージ解析（Haiku）
     analysis = analyze_message_full(message_text, user_name)
     mark_replied_context(group_id, user_id, message_text)
 
     save_message(timestamp, group_id, user_id, user_name,
-                 message_text, message_id, analysis, create_calendar=False)
+                 message_text, message_id, analysis)
 
     process_metadata(analysis, message_text, user_name, group_id, timestamp)
-
-    if not analysis.get('work_category'):
-        return
-
-    process_work_report(event, analysis, message_text, user_name, group_id, user_id)
 
 
 # ==================== 全メッセージ保存 ====================
@@ -582,15 +555,6 @@ def get_group_context(group_id):
         c = conn.cursor()
         today = datetime.now()
 
-        c.execute('''
-            SELECT work_category, user_name, SUM(work_hours), COUNT(*)
-            FROM messages
-            WHERE group_id=? AND work_category IS NOT NULL
-              AND work_date BETWEEN ? AND ?
-            GROUP BY work_category, user_name
-        ''', (group_id, today.strftime('%Y-%m-01'), today.strftime('%Y-%m-%d')))
-        work_rows = c.fetchall()
-
         threshold = (today - timedelta(hours=UNANSWERED_THRESHOLD_HOURS)).strftime('%Y-%m-%d %H:%M:%S')
         c.execute('''
             SELECT user_name, message, timestamp FROM messages
@@ -616,12 +580,6 @@ def get_group_context(group_id):
         conn.close()
 
         lines = [f"【今日: {today.strftime('%Y年%m月%d日')}】"]
-
-        if work_rows:
-            lines.append(f"\n今月（{today.month}月）の作業記録:")
-            for cat, name, hours, count in work_rows:
-                h = hours or 0
-                lines.append(f"  {name} / {cat}: {h:.1f}h（{count}件）")
 
         if unanswered_rows:
             lines.append(f"\n{UNANSWERED_THRESHOLD_HOURS}時間以上返信待ち:")
@@ -690,294 +648,12 @@ def ask_sonnet(query, user_name, db_context, history="", knowledge=""):
         return f"⚠️ エラーが発生しました: {str(e)[:50]}"
 
 
-# ==================== 作業報告の処理 ====================
-
-def process_work_report(event, analysis, message_text, user_name, group_id, user_id):
-    missing = get_missing_info(analysis, message_text)
-    if missing:
-        question = build_question(missing['state'], analysis, user_name)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=question))
-        save_pending_state(group_id, user_id, missing['state'], analysis, message_text)
-    else:
-        event_id = add_to_calendar(analysis, user_name, message_text)
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=build_confirmation(analysis, user_name))
-        )
-        save_pending_state(group_id, user_id, STATE_CONFIRMING, analysis, message_text, event_id)
-
-
-def get_missing_info(analysis, message_text):
-    if not analysis.get('work_hours'):
-        return {'state': STATE_ASKING_HOURS}
-    if not analysis.get('work_style') and _has_people_hint(message_text):
-        return {'state': STATE_ASKING_PEOPLE}
-    return None
-
-
-def _has_people_hint(text):
-    hints = ['一緒', '2人', '二人', 'と一緒', 'たちで', 'みんな', '手伝', '協力', '複数']
-    return any(h in text for h in hints)
-
-
-# ==================== 会話の続き ====================
-
-def handle_conversation_response(
-    event, pending, message_text, user_name,
-    group_id, user_id, timestamp, message_id
-):
-    state   = pending['state']
-    partial = pending['partial_analysis']
-    is_correction = any(kw in message_text for kw in CORRECTION_KEYWORDS)
-
-    if is_correction:
-        handle_correction(event, pending, message_text, user_name, group_id, user_id)
-        return
-
-    if state == STATE_CONFIRMING:
-        clear_pending_state(group_id, user_id)
-        analysis = analyze_message_full(message_text, user_name)
-        save_message(timestamp, group_id, user_id, user_name,
-                     message_text, message_id, analysis, create_calendar=False)
-        mark_replied_context(group_id, user_id, message_text)
-        if analysis.get('work_category'):
-            process_work_report(event, analysis, message_text, user_name, group_id, user_id)
-        return
-
-    if state == STATE_ASKING_HOURS:
-        updated = parse_hours_from_text(message_text, partial)
-        if not updated.get('work_hours'):
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text="⏱️ 時間が読み取れませんでした。\n「3時間」「2.5h」「半日」などで教えてください🙏"
-            ))
-            return
-        _finalize_or_ask_more(
-            event, updated, pending['original_message'],
-            user_name, group_id, user_id, timestamp, message_id
-        )
-
-    elif state == STATE_ASKING_PEOPLE:
-        updated = parse_people_from_text(message_text, partial, user_name)
-        event_id = add_to_calendar(updated, user_name, pending['original_message'])
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=build_confirmation(updated, user_name))
-        )
-        save_pending_state(
-            group_id, user_id, STATE_CONFIRMING,
-            updated, pending['original_message'], event_id
-        )
-
-
-def _finalize_or_ask_more(
-    event, analysis, original_message, user_name,
-    group_id, user_id, timestamp, message_id
-):
-    missing = get_missing_info(analysis, original_message)
-    if missing:
-        question = build_question(missing['state'], analysis, user_name)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=question))
-        save_pending_state(group_id, user_id, missing['state'], analysis, original_message)
-    else:
-        event_id = add_to_calendar(analysis, user_name, original_message)
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=build_confirmation(analysis, user_name))
-        )
-        save_pending_state(
-            group_id, user_id, STATE_CONFIRMING,
-            analysis, original_message, event_id
-        )
-
-
-def handle_correction(event, pending, message_text, user_name, group_id, user_id):
-    last_event_id = pending.get('last_event_id')
-    last_analysis = pending.get('partial_analysis', {})
-    if last_event_id:
-        delete_calendar_event(last_event_id)
-    corrected = last_analysis.copy()
-    if ANTHROPIC_API_KEY:
-        try:
-            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-            cat_str = "、".join(WORK_CATEGORIES)
-            prompt = (
-                f"前回の作業報告と記録内容、修正指示から、正しい情報をJSONで返してください。\n\n"
-                f"前回の報告: {pending.get('original_message', '')}\n"
-                f"記録された内容: {json.dumps(last_analysis, ensure_ascii=False)}\n"
-                f"修正指示: {message_text}\n\n"
-                f"以下のJSONのみを返してください（説明文不要）:\n"
-                f'{{\n  "work_category": "{cat_str} のいずれか",\n'
-                f'  "work_hours": 数値またはnull,\n  "work_date": "YYYY-MM-DD",\n'
-                f'  "work_style": "本田+荻原" または "本田（単独）" または "荻原（単独）" または null\n}}'
-            )
-            response = client.messages.create(
-                model=MODEL_FAST, max_tokens=200,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            result = response.content[0].text.strip()
-            if '{' in result:
-                result = result[result.index('{'):result.rindex('}') + 1]
-            corrected = {**last_analysis, **json.loads(result)}
-        except Exception as e:
-            print(f"Correction parse error: {e}")
-    event_id = add_to_calendar(corrected, user_name, pending.get('original_message', ''))
-    reply = "✏️ 修正しました！\n" + build_confirmation(corrected, user_name, header="")
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-    save_pending_state(
-        group_id, user_id, STATE_CONFIRMING,
-        corrected, pending.get('original_message', ''), event_id
-    )
-
-
-# ==================== メッセージ生成 ====================
-
-def build_question(state, analysis, user_name):
-    cat = analysis.get('work_category', '作業')
-    if state == STATE_ASKING_HOURS:
-        return (
-            f"📝 {user_name}さん、{cat}の作業ですね！\n"
-            f"作業時間を教えてください🙏\n"
-            f"（例：「3時間」「2.5h」「半日」「終日」）"
-        )
-    elif state == STATE_ASKING_PEOPLE:
-        return (
-            f"📝 {cat}の作業ですね！\n"
-            f"何人で作業しましたか？\n"
-            f"① {user_name}さん単独\n"
-            f"② 本田さんと2人\n"
-            f"③ 荻原さんと2人\n"
-            f"④ 本田さん＋荻原さんと3人"
-        )
-    return "詳しく教えてください。"
-
-
-def build_confirmation(analysis, user_name, header="✅ 記録しました！\n"):
-    cat   = analysis.get('work_category', '')
-    date  = analysis.get('work_date') or datetime.now().strftime('%Y-%m-%d')
-    hours = analysis.get('work_hours')
-    style = analysis.get('work_style')
-    try:
-        d = datetime.strptime(date, '%Y-%m-%d')
-        date_str = f"{d.month}/{d.day}（{WEEKDAY_JP[d.weekday()]}）"
-    except Exception:
-        date_str = date
-    lines = [header + "━━━━━━━━━━━━"]
-    lines.append(f"📋 {cat}")
-    lines.append(f"📅 {date_str}")
-    if hours:
-        lines.append(f"⏱️ {hours:.1f}時間")
-    lines.append(f"👤 {user_name}")
-    if style:
-        lines.append(f"👥 {style}")
-    lines.append("━━━━━━━━━━━━")
-    lines.append("間違いがあれば「修正して」と教えてください🙏")
-    return "\n".join(lines)
-
-
-# ==================== 応答パース ====================
-
-def parse_hours_from_text(text, partial_analysis):
-    updated = dict(partial_analysis)
-    m = re.search(r'(\d+(?:\.\d+)?)\s*[hｈ時間]', text)
-    if m:
-        updated['work_hours'] = float(m.group(1))
-        return updated
-    if '午前' in text or '午後' in text:
-        updated['work_hours'] = 3.0
-    elif '半日' in text:
-        updated['work_hours'] = 4.0
-    elif '終日' in text or '一日' in text or '1日' in text:
-        updated['work_hours'] = 8.0
-    elif ANTHROPIC_API_KEY:
-        try:
-            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-            r = client.messages.create(
-                model=MODEL_FAST, max_tokens=30,
-                messages=[{"role": "user", "content": f"「{text}」から作業時間を数値（時間単位）で抽出してください。数値のみ返して。不明なら「null」。"}]
-            )
-            h = r.content[0].text.strip()
-            if h != 'null':
-                updated['work_hours'] = float(h)
-        except Exception:
-            pass
-    return updated
-
-
-def parse_people_from_text(text, partial_analysis, user_name):
-    updated = dict(partial_analysis)
-    if '①' in text or '単独' in text or '一人' in text or '1人' in text:
-        updated['work_style'] = None
-    elif '④' in text or ('本田' in text and '荻原' in text) or '3人' in text or '三人' in text:
-        updated['work_style'] = '本田+荻原'
-    elif '②' in text or '本田' in text:
-        updated['work_style'] = '本田（単独）'
-    elif '③' in text or '荻原' in text:
-        updated['work_style'] = '荻原（単独）'
-    else:
-        updated['work_style'] = None
-    return updated
-
-
-# ==================== 会話ステート管理 ====================
-
-def get_pending_state(group_id, user_id):
-    cutoff = (datetime.now() - timedelta(minutes=15)).strftime('%Y-%m-%d %H:%M:%S')
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        SELECT state, partial_analysis, original_message, last_event_id
-        FROM conversations
-        WHERE group_id=? AND user_id=? AND updated_at>?
-        ORDER BY updated_at DESC LIMIT 1
-    ''', (group_id, user_id, cutoff))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return {
-            'state': row[0],
-            'partial_analysis': json.loads(row[1]) if row[1] else {},
-            'original_message': row[2] or '',
-            'last_event_id': row[3]
-        }
-    return None
-
-
-def save_pending_state(
-    group_id, user_id, state, partial_analysis, original_message, last_event_id=None
-):
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('DELETE FROM conversations WHERE group_id=? AND user_id=?', (group_id, user_id))
-    c.execute('''
-        INSERT INTO conversations
-        (group_id, user_id, state, partial_analysis, original_message,
-         last_event_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (
-        group_id, user_id, state,
-        json.dumps(partial_analysis, ensure_ascii=False),
-        original_message, last_event_id, now, now
-    ))
-    conn.commit()
-    conn.close()
-
-
-def clear_pending_state(group_id, user_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('DELETE FROM conversations WHERE group_id=? AND user_id=?', (group_id, user_id))
-    conn.commit()
-    conn.close()
-
 
 # ==================== コマンド ====================
 
 def handle_command(event, text, group_id):
     cmd = text.lower().strip()
-    if cmd in ['/集計', '/summary']:
-        reply = get_monthly_summary(group_id)
-    elif cmd in ['/未返信', '/unanswered']:
+    if cmd in ['/未返信', '/unanswered']:
         reply = get_unanswered_list(group_id)
     elif cmd in ['/タスク', '/todo']:
         reply = get_todo_list(group_id)
@@ -989,6 +665,8 @@ def handle_command(event, text, group_id):
         reply = get_knowledge_list(group_id)
     elif cmd in ['/共通知識', '/shared']:
         reply = get_shared_knowledge_list()
+    elif cmd in ['/グループid', '/groupid', '/group_id']:
+        reply = f"🦉 このグループのID\n\n{group_id}\n\nRailwayの環境変数 ADMIN_GROUP_ID にこの値を設定すると、このグループが管理グループになります。"
     elif cmd in ['/週報', '/weekly']:
         reply = build_weekly_report(group_id) or "📊 今週はまだデータがありません。"
     elif cmd in ['/ヘルプ', '/help']:
@@ -1005,10 +683,7 @@ def handle_command(event, text, group_id):
             "質問・調べもの・過去の話…気軽に🦉\n\n"
             "【知識の記憶】\n"
             "「覚えておいて：○○」→ このグループ専用🔒\n"
-            "「共通で覚えておいて：○○」→ 全グループ共通🌐\n\n"
-            "【営農グループ限定】\n"
-            "「/集計」→ 今月の作業時間集計\n"
-            "作業報告は自動で記録・分類されます✏️"
+            "「共通で覚えておいて：○○」→ 全グループ共通🌐"
         )
     else:
         return
@@ -1107,30 +782,6 @@ def get_shared_knowledge_list():
     return "\n".join(lines)
 
 
-def get_monthly_summary(group_id):
-    today = datetime.now()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        SELECT work_category, SUM(work_hours), COUNT(*)
-        FROM messages
-        WHERE group_id=? AND work_category IS NOT NULL
-          AND work_date BETWEEN ? AND ?
-        GROUP BY work_category ORDER BY SUM(work_hours) DESC
-    ''', (group_id, today.strftime('%Y-%m-01'), today.strftime('%Y-%m-%d')))
-    rows = c.fetchall()
-    conn.close()
-    if not rows:
-        return f"📊 {today.month}月の作業記録はまだありません。"
-    lines = [f"📊 {today.month}月の作業時間集計\n"]
-    total = 0
-    for cat, hours, count in rows:
-        h = hours or 0
-        total += h
-        lines.append(f"  {cat}: {h:.1f}h（{count}件）")
-    lines.append(f"\n合計: {total:.1f}h")
-    return "\n".join(lines)
-
 
 def get_unanswered_list(group_id):
     threshold = (
@@ -1163,14 +814,6 @@ def build_weekly_report(group_id):
     c = conn.cursor()
 
     c.execute('''
-        SELECT work_category, user_name, SUM(work_hours), COUNT(*)
-        FROM messages
-        WHERE group_id=? AND work_category IS NOT NULL AND timestamp>?
-        GROUP BY work_category, user_name
-    ''', (group_id, week_ago))
-    work_rows = c.fetchall()
-
-    c.execute('''
         SELECT decision, decided_by FROM decisions
         WHERE group_id=? AND created_at>? ORDER BY created_at DESC LIMIT 5
     ''', (group_id, week_ago))
@@ -1190,19 +833,13 @@ def build_weekly_report(group_id):
 
     conn.close()
 
-    if not work_rows and not decision_rows and not todo_rows:
+    if not decision_rows and not todo_rows:
         return None
 
     lines = [f"🦉 週報（{today.strftime('%m/%d')}）\n━━━━━━━━━━━━"]
 
-    if work_rows:
-        lines.append("【今週の作業】")
-        for cat, name, hours, count in work_rows:
-            h = hours or 0
-            lines.append(f"  {name}: {cat} {h:.1f}h")
-
     if decision_rows:
-        lines.append("\n【今週の決定事項】")
+        lines.append("【今週の決定事項】")
         for decision, decided_by in decision_rows:
             lines.append(f"  ・{decision}")
 
@@ -1279,11 +916,10 @@ def mark_replied_context(group_id, user_id, message_text):
 # ==================== Claude解析（Haiku） ====================
 
 def analyze_message_full(text, user_name):
-    """メッセージを総合解析（作業報告・ToDo・決定事項・未決案件）"""
+    """メッセージを総合解析（ToDo・決定事項・未決案件）"""
     if not ANTHROPIC_API_KEY:
         return _simple_analyze(text)
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    categories_str = "、".join(WORK_CATEGORIES)
     today_str = datetime.now().strftime('%Y-%m-%d')
     prompt = f"""農業グループのLINEメッセージを分析し、以下のJSONのみを返してください（説明文不要）。
 
@@ -1293,10 +929,6 @@ def analyze_message_full(text, user_name):
 
 {{
   "needs_reply": true/false,
-  "work_category": "{categories_str} のいずれか、または null",
-  "work_hours": 数値またはnull,
-  "work_date": "YYYY-MM-DD" または null,
-  "work_style": "本田+荻原" / "本田（単独）" / "荻原（単独）" / null,
   "has_todo": true/false,
   "todo_text": "タスクの内容" または null,
   "todo_assignee": "担当者名" または null,
@@ -1312,7 +944,7 @@ def analyze_message_full(text, user_name):
 - is_pending_issue: 「〜どうする？」「〜検討しよう」「〜考えないと」など未解決の課題がある"""
     try:
         response = client.messages.create(
-            model=MODEL_FAST, max_tokens=400,
+            model=MODEL_FAST, max_tokens=300,
             messages=[{"role": "user", "content": prompt}]
         )
         result_text = response.content[0].text.strip()
@@ -1326,96 +958,78 @@ def analyze_message_full(text, user_name):
 
 def _simple_analyze(text):
     needs_reply = any(kw in text for kw in ['？', '?', 'どうします', 'お願い', '確認', '教えて'])
-    m = re.search(r'(\d+(?:\.\d+)?)\s*[hｈ時間]', text)
-    work_hours = float(m.group(1)) if m else None
-    work_cat = None
-    for cat, kws in {
-        '水稲': ['水稲', '田植え', '稲刈り', 'コンバイン'],
-        '大豆': ['大豆', '枝豆'],
-        '除草・畔草刈': ['除草', '草刈', '畔'],
-        '水管理・用水路': ['水管理', '水路'],
-        '農機・施設管理': ['トラクター', '農機', '機械'],
-    }.items():
-        if any(kw in text for kw in kws):
-            work_cat = cat
-            break
     return {
         "needs_reply": needs_reply,
-        "work_category": work_cat,
-        "work_hours": work_hours,
-        "work_date": datetime.now().strftime('%Y-%m-%d'),
-        "work_style": None,
         "has_todo": False, "todo_text": None, "todo_assignee": None,
         "has_decision": False, "decision_text": None,
         "is_pending_issue": False, "pending_summary": None
     }
 
 
-# ==================== Googleカレンダー ====================
+# ==================== Googleスプレッドシート ====================
 
-def get_calendar_service():
+def get_sheets_service():
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
         return None
     try:
         creds = service_account.Credentials.from_service_account_info(
             json.loads(GOOGLE_SERVICE_ACCOUNT_JSON),
-            scopes=['https://www.googleapis.com/auth/calendar']
+            scopes=['https://www.googleapis.com/auth/spreadsheets']
         )
-        return build('calendar', 'v3', credentials=creds)
+        return build('sheets', 'v4', credentials=creds)
     except Exception as e:
-        print(f"Calendar service error: {e}")
+        print(f"Sheets service error: {e}")
         return None
 
 
-def add_to_calendar(analysis, user_name, message_text):
-    if not analysis.get('work_category'):
-        return None
-    service = get_calendar_service()
+def append_to_sheet(timestamp, group_name, user_name, message):
+    if not GOOGLE_SPREADSHEET_ID:
+        return
+    service = get_sheets_service()
     if not service:
-        return None
-    work_date = analysis.get('work_date') or datetime.now().strftime('%Y-%m-%d')
-    try:
-        datetime.strptime(work_date, '%Y-%m-%d')
-    except ValueError:
-        work_date = datetime.now().strftime('%Y-%m-%d')
-    hours = analysis.get('work_hours')
-    style = analysis.get('work_style')
-    title_parts = [f"【{analysis['work_category']}】"]
-    if hours:
-        title_parts.append(f"{hours:.1f}h")
-    title_parts.append(f"- {user_name}")
-    if style:
-        title_parts.append(f"({style})")
-    event = {
-        'summary': " ".join(title_parts),
-        'description': f"📱 LINEからの作業報告\n👤 {user_name}\n💬 {message_text}" + (f"\n👥 {style}" if style else ""),
-        'start': {'date': work_date},
-        'end':   {'date': work_date},
-        'colorId': '2',
-    }
-    try:
-        result = service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
-        return result.get('id')
-    except Exception as e:
-        print(f"Calendar insert error: {e}")
-        return None
-
-
-def delete_calendar_event(event_id):
-    service = get_calendar_service()
-    if not service or not event_id:
         return
     try:
-        service.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=event_id).execute()
+        service.spreadsheets().values().append(
+            spreadsheetId=GOOGLE_SPREADSHEET_ID,
+            range='シート1!A:D',
+            valueInputOption='USER_ENTERED',
+            insertDataOption='INSERT_ROWS',
+            body={'values': [[timestamp, group_name, user_name, message]]}
+        ).execute()
     except Exception as e:
-        print(f"Calendar delete error: {e}")
+        print(f"Sheets append error: {e}")
+
+
+def init_sheet_header():
+    """スプレッドシートが空なら1行目にヘッダーを追加する"""
+    if not GOOGLE_SPREADSHEET_ID:
+        return
+    service = get_sheets_service()
+    if not service:
+        return
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=GOOGLE_SPREADSHEET_ID,
+            range='シート1!A1'
+        ).execute()
+        if not result.get('values'):
+            service.spreadsheets().values().update(
+                spreadsheetId=GOOGLE_SPREADSHEET_ID,
+                range='シート1!A1',
+                valueInputOption='USER_ENTERED',
+                body={'values': [['日時', 'グループ名', '送信者', 'メッセージ']]}
+            ).execute()
+    except Exception as e:
+        print(f"Sheets header error: {e}")
+
+
+init_sheet_header()
 
 
 # ==================== DB保存 ====================
 
 def save_message(
-    timestamp, group_id, user_id, user_name, message, message_id,
-    analysis, create_calendar=True
+    timestamp, group_id, user_id, user_name, message, message_id, analysis
 ):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -1423,13 +1037,11 @@ def save_message(
         c.execute('''
             INSERT OR IGNORE INTO messages
             (timestamp, group_id, user_id, user_name, message, message_id,
-             needs_reply, work_category, work_hours, work_date, work_style, raw_analysis)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             needs_reply, raw_analysis)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             timestamp, group_id, user_id, user_name, message, message_id,
             1 if analysis.get('needs_reply') else 0,
-            analysis.get('work_category'), analysis.get('work_hours'),
-            analysis.get('work_date'), analysis.get('work_style'),
             json.dumps(analysis, ensure_ascii=False)
         ))
         conn.commit()
@@ -1437,8 +1049,6 @@ def save_message(
         print(f"DB save error: {e}")
     finally:
         conn.close()
-    if create_calendar and analysis.get('work_category'):
-        add_to_calendar(analysis, user_name, message)
 
 
 # ==================== ヘルスチェック ====================
