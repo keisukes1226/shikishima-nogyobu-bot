@@ -1,7 +1,7 @@
 """
-しきしまの家 営農部 LINE業務サポートボット v5
+しきしまの家自給家族 LINEサポートボット
 - 全メッセージ保存・さかのぼり検索
-- 作業報告を自動記録・分類（Haiku）
+- やり取りの自動記録・分類（Haiku）
 - ToDoの自動抽出・管理
 - 決定事項の自動記録
 - 未決案件の検知・フォローアップ
@@ -10,7 +10,7 @@
 - 画像を送ると内容を解析・説明（Sonnet Vision）
 - 毎朝9時：スルー検知・未決フォローアップ
 - 毎週月曜：週報自動投稿
-- Googleカレンダーに作業記録を転記
+- Googleカレンダーに記録を転記
 """
 
 import os
@@ -312,13 +312,11 @@ def analyze_image_with_sonnet(image_base64, user_name):
             model=MODEL_SMART,
             max_tokens=600,
             system=(
-                "あなたは「オルオル」。日本の豊かな農村に太古の昔から棲み続けるフクロウの神様です。\n"
-                "送られてきた画像を見て、農業・自然・生き物・植物・病害虫・農作物・農機具・"
-                "現場の状況など、何でも詳しく解説してください。\n"
+                "あなたは「オルオル」。しきしまの家自給家族のLINEグループを見守る秘書的な存在です。\n"
+                "送られてきた画像を見て、写っている内容を詳しく解説してください。\n"
                 "【回答ルール】\n"
                 "- 何が写っているか簡潔に特定する\n"
-                "- 農業や現場作業に関連する情報があれば詳しく補足する\n"
-                "- 病害虫・雑草の場合は対処法も添える\n"
+                "- 内容に関連する有用な情報があれば補足する\n"
                 "- LINEなので長くても15行以内\n"
                 "- 絵文字は🦉を中心に適度に使う\n"
                 "- 判別が難しい場合は正直にその旨を伝える"
@@ -609,20 +607,15 @@ def ask_sonnet(query, user_name, db_context, history="", knowledge=""):
         return "申し訳ありません、AIサービスに接続できません。"
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        system_prompt = f"""あなたは「オルオル」。日本の豊かな農村に太古の昔から棲み続けるフクロウの神様です。
-夜の生態系の頂点に立ち、里山が豊かである限りそこに宿る存在として、
-人々の農の営みと暮らしをずっと見守ってきました。
+        system_prompt = f"""あなたは「オルオル」。しきしまの家自給家族のLINEグループを見守る秘書です。
+顧客・メンバーとのやり取りを丁寧にサポートし、
+必要な情報を素早く引き出したり、記録を整理したりする頼れる存在です。
 
-その長い時の中で、農業・自然・気象・生き物・人の暮らし・歴史・文化・
-地域のこと、あらゆる知識と知恵を深く蓄えています。
-
-あるときは専門家のように正確な知識で答え、
-あるときは物事の本質へと導く神のように語り、
-あるときは寄り添う友人のように温かく接し、
-基本的にはグループメンバーを支える秘書として振る舞います。
-
-特定の組織や団体に属する存在ではなく、
-豊かな農村があればどこにでも宿る、普遍的な存在です。
+豊富な知識と記憶力を活かして、
+あるときは正確な情報を提供し、
+あるときは過去のやり取りから必要な経緯を掘り起こし、
+あるときは温かく寄り添う友人のように接しながら、
+常にグループメンバーと顧客の橋渡しをする秘書として振る舞います。
 
 {db_context}
 {history}
@@ -921,7 +914,7 @@ def analyze_message_full(text, user_name):
         return _simple_analyze(text)
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     today_str = datetime.now().strftime('%Y-%m-%d')
-    prompt = f"""農業グループのLINEメッセージを分析し、以下のJSONのみを返してください（説明文不要）。
+    prompt = f"""LINEグループのメッセージを分析し、以下のJSONのみを返してください（説明文不要）。
 
 送信者: {user_name}
 メッセージ: {text}
@@ -972,8 +965,14 @@ def get_sheets_service():
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
         return None
     try:
+        json_str = GOOGLE_SERVICE_ACCOUNT_JSON
+        try:
+            info = json.loads(json_str)
+        except json.JSONDecodeError:
+            # Railwayが改行文字をそのまま埋め込む場合に対応
+            info = json.loads(json_str.replace('\n', '\\n'))
         creds = service_account.Credentials.from_service_account_info(
-            json.loads(GOOGLE_SERVICE_ACCOUNT_JSON),
+            info,
             scopes=['https://www.googleapis.com/auth/spreadsheets']
         )
         return build('sheets', 'v4', credentials=creds)
@@ -1071,6 +1070,51 @@ def health():
         'pending_issues': pending_count,
         'models': {'fast': MODEL_FAST, 'smart': MODEL_SMART}
     }
+
+
+# ==================== 過去ログ移行（一時エンドポイント） ====================
+
+@app.route("/migrate_to_sheets", methods=['GET'])
+def migrate_to_sheets():
+    if not GOOGLE_SPREADSHEET_ID:
+        return {'error': 'GOOGLE_SPREADSHEET_ID not set'}, 400
+    service = get_sheets_service()
+    if not service:
+        return {'error': 'Sheets service unavailable'}, 400
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT timestamp, group_id, user_name, message FROM all_messages ORDER BY timestamp ASC')
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        return {'message': 'No messages found', 'count': 0}
+
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=GOOGLE_SPREADSHEET_ID, range='シート1!A:A'
+        ).execute()
+        existing_rows = len(result.get('values', []))
+    except Exception:
+        existing_rows = 0
+
+    if existing_rows > 1:
+        return {'message': f'Already has {existing_rows - 1} data rows. Skipping.', 'existing': existing_rows - 1}
+
+    values = [[ts, get_group_name(gid), uname or '', msg or ''] for ts, gid, uname, msg in rows]
+
+    batch_size = 500
+    for i in range(0, len(values), batch_size):
+        service.spreadsheets().values().append(
+            spreadsheetId=GOOGLE_SPREADSHEET_ID,
+            range='シート1!A:D',
+            valueInputOption='USER_ENTERED',
+            insertDataOption='INSERT_ROWS',
+            body={'values': values[i:i + batch_size]}
+        ).execute()
+
+    return {'message': 'Migration complete', 'written': len(values)}
 
 
 if __name__ == "__main__":
